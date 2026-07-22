@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+
+# Env files (keep example, ignore actual)
+.env.local
+.env.*.local
+
+# Logs — keep directory, ignore content
+logs/*.log
+logs/*.jsonl
+logs/*.txt
+!logs/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Coverage / test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets (extra safety net)
+*.pem
+*.key
+secrets.json
