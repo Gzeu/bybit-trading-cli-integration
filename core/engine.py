@@ -3,7 +3,7 @@ Shared Trading Engine
 Used by all strategies as base layer.
 Provides: CLI wrapper, position sizing, ATR calc, logging, Telegram, error handling.
 """
-import subprocess, json, os, time, statistics, datetime
+import subprocess, json, os, time, statistics, datetime, argparse, sys
 from pathlib import Path
 
 # --- Config ---
@@ -87,6 +87,79 @@ def get_funding_rate(symbol=None, category=None):
     return float(ticker.get("fundingRate", 0))
 
 
+# --- Snapshot (used by llm/agent_loop.py) ---
+def build_snapshot(symbol=None, category=None) -> dict:
+    """Collect market + account state and return as a JSON-serialisable dict.
+    Called via: python -m core.engine --snapshot [--json]
+    """
+    sym = symbol or SYMBOL
+    cat = category or CATEGORY
+    ts  = datetime.datetime.utcnow().isoformat() + "Z"
+
+    ticker   = get_ticker(sym, cat)
+    balance  = get_balance()
+    position = get_position(sym, cat)
+    candles  = get_klines(interval="60", limit=50, symbol=sym, category=cat)
+
+    price      = float(ticker.get("lastPrice", 0))
+    bid        = float(ticker.get("bid1Price", 0))
+    ask        = float(ticker.get("ask1Price", 0))
+    funding    = float(ticker.get("fundingRate", 0))
+    volume_24h = float(ticker.get("volume24h", 0))
+    price_24h_pct = float(ticker.get("price24hPcnt", 0))
+
+    cl = closes(candles) if candles else []
+    current_rsi  = round(rsi(cl), 2)  if len(cl) >= 15 else None
+    current_atr  = round(atr(candles), 4) if len(candles) >= 15 else None
+    current_ema20 = round(ema(cl, 20), 4) if len(cl) >= 20 else None
+    current_ema50 = round(ema(cl, 50), 4) if len(cl) >= 50 else None
+    current_zscore = round(zscore(cl), 4) if len(cl) >= 50 else None
+
+    # Regime hint: above/below EMA50
+    regime = "unknown"
+    if current_ema50 and price:
+        regime = "bullish" if price > current_ema50 else "bearish"
+
+    pos_summary = None
+    if position:
+        pos_summary = {
+            "side":        position.get("side"),
+            "size":        float(position.get("size", 0)),
+            "entry_price": float(position.get("avgPrice", 0)),
+            "unrealised_pnl": float(position.get("unrealisedPnl", 0)),
+            "liq_price":   float(position.get("liqPrice", 0)),
+            "leverage":    float(position.get("leverage", LEVERAGE)),
+        }
+
+    snapshot = {
+        "timestamp":     ts,
+        "env":           BYBIT_ENV,
+        "symbol":        sym,
+        "category":      cat,
+        "price":         price,
+        "bid":           bid,
+        "ask":           ask,
+        "spread_pct":    round((ask - bid) / price * 100, 4) if price else 0,
+        "price_24h_pct": price_24h_pct,
+        "volume_24h":    volume_24h,
+        "funding_rate":  funding,
+        "balance_usdt":  round(balance, 4),
+        "max_risk_pct":  MAX_RISK_PCT,
+        "leverage":      LEVERAGE,
+        "indicators": {
+            "rsi_14":    current_rsi,
+            "atr_14":    current_atr,
+            "ema_20":    current_ema20,
+            "ema_50":    current_ema50,
+            "zscore_50": current_zscore,
+            "regime":    regime,
+        },
+        "open_position": pos_summary,
+        "kill_switch_active": False,  # can be overridden by safety_check()
+    }
+    return snapshot
+
+
 # --- Indicators ---
 def ema_series(prices, period):
     k = 2 / (period + 1)
@@ -132,7 +205,6 @@ def calc_qty(stop_distance, risk_pct=None, balance=None):
         return float(os.getenv("QTY", "0.01"))
     risk = balance * (risk_pct or MAX_RISK_PCT)
     qty = risk / stop_distance
-    # Round to 3 decimal places, min 0.001
     qty = max(round(qty, 3), 0.001)
     return qty
 
@@ -260,3 +332,46 @@ def safety_check(max_daily_loss_pct=0.03):
     except Exception as e:
         log_error(f"Safety check failed: {e}")
         return True  # don't block on check failure
+
+
+# --- CLI entrypoint (python -m core.engine) ---
+def _cli_main():
+    parser = argparse.ArgumentParser(description="Trading Engine CLI")
+    parser.add_argument("--snapshot", action="store_true",
+                        help="Print market + account snapshot as JSON and exit")
+    parser.add_argument("--json", action="store_true",
+                        help="Force JSON output (used with --snapshot)")
+    parser.add_argument("--action", type=str, help="Action to execute")
+    parser.add_argument("--symbol", type=str, default=SYMBOL)
+    parser.add_argument("--qty",    type=float, default=0.0)
+    parser.add_argument("--strategy", type=str, default="none")
+    parser.add_argument("--sl",    type=float, default=0.0)
+    parser.add_argument("--tp",    type=float, default=0.0)
+    args = parser.parse_args()
+
+    if args.snapshot:
+        snap = build_snapshot(symbol=args.symbol)
+        print(json.dumps(snap, indent=2 if not args.json else None))
+        return
+
+    if args.action:
+        action_map = {
+            "open_long":      lambda: enter("Buy",  args.qty, args.sl, args.tp or None, args.strategy),
+            "open_short":     lambda: enter("Sell", args.qty, args.sl, args.tp or None, args.strategy),
+            "close_position": lambda: close_position(),
+            "reduce_size":    lambda: close_position(),  # partial reduce not yet implemented
+        }
+        fn = action_map.get(args.action)
+        if fn:
+            result = fn()
+            print(json.dumps(result))
+        else:
+            print(json.dumps({"error": f"Unknown action: {args.action}"}))
+            sys.exit(1)
+        return
+
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    _cli_main()
