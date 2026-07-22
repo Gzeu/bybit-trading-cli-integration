@@ -101,14 +101,26 @@ SYSTEM_PROMPT_PATH = Path(__file__).parent / "SYSTEM_PROMPT.md"
 BRIEFING_PATH      = Path(__file__).parent.parent / "agent" / "AGENT_BRIEFING.md"
 
 # ---------------------------------------------------------------------------
-# Global agent state (mutable by Telegram commands)
+# Global agent state — thread-safe via _state_lock (#7)
 # ---------------------------------------------------------------------------
 
+_state_lock = threading.Lock()
 _state = {
     "paused":    False,
     "dry_run":   os.getenv("DRY_RUN", "false").lower() == "true",
-    "force_sym": None,  # symbol to force into next scan
+    "force_sym": None,
+    "stop":      False,
 }
+
+
+def _set_state(**kwargs) -> None:
+    with _state_lock:
+        _state.update(kwargs)
+
+
+def _get_state(key: str, default=None):
+    with _state_lock:
+        return _state.get(key, default)
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +323,13 @@ def validate_action(action: dict) -> bool:
     return True
 
 
-def _reduce_position(symbol: str, category: str = "linear", reduce_pct: float = 0.5) -> dict:
-    pos = ctx_global.position_for(symbol) if ctx_global else None
+def _reduce_position(
+    symbol: str,
+    category: str = "linear",
+    reduce_pct: float = 0.5,
+    ctx: AgentContext | None = None,
+) -> dict:
+    pos = ctx.position_for(symbol) if ctx else None
     if not pos:
         from core.engine import get_position
         pos = get_position(symbol, category)
@@ -327,15 +344,16 @@ def _reduce_position(symbol: str, category: str = "linear", reduce_pct: float = 
         "order", "create",
         "--category", category, "--symbol", symbol,
         "--side", close_side, "--orderType", "Market",
+        "--timeInForce", "IOC",
         "--qty", str(reduce_qty), "--reduceOnly", "true",
         "--cap-usd", CAP_USD, "--yes",
     )
 
 
-ctx_global: AgentContext | None = None  # set each tick for reduce_position access
+def execute_action(action: dict, dry_run: bool = False,
+                   ctx: AgentContext | None = None) -> None:
+    from core.order_utils import choose_order_type
 
-
-def execute_action(action: dict, dry_run: bool = False) -> None:
     act    = action["action"]
     symbol = str(action.get("symbol", os.getenv("DEFAULT_SYMBOL", SYMBOL)))
     cat    = os.getenv("CATEGORY", CATEGORY)
@@ -349,24 +367,37 @@ def execute_action(action: dict, dry_run: bool = False) -> None:
         return
 
     try:
-        if act == "open_long":
-            result = enter(
-                side="Buy", qty=float(action.get("qty", 0)),
-                stop_loss=float(action["sl"]),
-                take_profit=float(action["tp"]) if action.get("tp") else None,
-                reason=str(action.get("strategy", "")),
+        if act in {"open_long", "open_short"}:
+            side = "Buy" if act == "open_long" else "Sell"
+            spread = ctx.spread_pct(symbol) if ctx else 0.05
+            otype, tif = choose_order_type(
+                spread,
+                urgency=False,
+                strategy_hint=str(action.get("strategy", "")),
             )
-        elif act == "open_short":
+            limit_px = None
+            if otype == "Limit" and ctx:
+                ob = ctx.orderbook.get(symbol, {})
+                limit_px = float(ob.get("bid") or 0) if side == "Buy" \
+                           else float(ob.get("ask") or 0)
+                if not limit_px:
+                    ticker = ctx.ticker.get(symbol, {})
+                    limit_px = float(ticker.get("bid1Price" if side == "Buy" else "ask1Price", 0)) or None
+
             result = enter(
-                side="Sell", qty=float(action.get("qty", 0)),
+                side=side,
+                qty=float(action.get("qty", 0)),
                 stop_loss=float(action["sl"]),
                 take_profit=float(action["tp"]) if action.get("tp") else None,
                 reason=str(action.get("strategy", "")),
+                order_type=otype,
+                time_in_force=tif,
+                limit_price=limit_px,
             )
         elif act == "close_position":
             result = close_position()
         elif act == "reduce_size":
-            result = _reduce_position(symbol, cat, reduce_pct=0.5)
+            result = _reduce_position(symbol, cat, reduce_pct=0.5, ctx=ctx)
         else:
             log.error(f"Unhandled action: {act}")
             return
@@ -404,18 +435,18 @@ def handle_command(
                         f"({ctx.today_pnl_pct:+.4f}%)")
 
     elif c == "pause":
-        _state["paused"] = True
+        _set_state(paused=True)
         comms.reply(cmd, "⏸ Trading *paused* — all decisions will be HOLD.")
         log.info("[comms] Agent paused via Telegram")
 
     elif c == "resume":
-        _state["paused"] = False
+        _set_state(paused=False)
         comms.reply(cmd, "▶️ Trading *resumed*.")
         log.info("[comms] Agent resumed via Telegram")
 
     elif c == "dry":
         val = (cmd.args[0].lower() != "off") if cmd.args else True
-        _state["dry_run"] = val
+        _set_state(dry_run=val)
         comms.reply(cmd, f"🧪 Dry-run: *{'ON' if val else 'OFF'}*")
 
     elif c == "watchlist":
@@ -424,7 +455,7 @@ def handle_command(
     elif c == "force":
         sym = cmd.args[0].upper() if cmd.args else ""
         if sym:
-            _state["force_sym"] = sym
+            _set_state(force_sym=sym)
             comms.reply(cmd, f"Next tick will force scan `{sym}`")
         else:
             comms.reply(cmd, "Usage: /force SYMBOL")
@@ -432,8 +463,7 @@ def handle_command(
     elif c == "stop":
         comms.reply(cmd, "🛑 Stopping agent after this tick...")
         log.info("[comms] Stop requested via Telegram")
-        # signal via state; main loop checks this
-        _state["stop"] = True
+        _set_state(stop=True)
 
     elif c == "help":
         comms.reply(cmd,
@@ -457,7 +487,6 @@ def run_once(
     dry_run: bool = False,
     comms: TelegramComms | None = None,
 ) -> dict:
-    global ctx_global
     t0 = time.time()
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S UTC")
     log.info(f"=== Tick | {ts} ===")
@@ -466,9 +495,6 @@ def run_once(
     if comms:
         for cmd in comms.poll_commands():
             log.info(f"[comms] cmd=/{cmd.cmd} args={cmd.args} from={cmd.user}")
-            # Need ctx for /status — build minimal if not available yet
-            # We'll pass None ctx here; handle_command handles None gracefully
-            # after collection below. Commands that need ctx are deferred.
             if cmd.cmd in {"pause", "resume", "dry", "stop", "force", "help"}:
                 handle_command(cmd, comms, AgentContext(), [])
 
@@ -477,21 +503,22 @@ def run_once(
         watchlist = manual_watchlist
     else:
         watchlist = build_watchlist()
-        if _state.get("force_sym"):
-            sym = _state.pop("force_sym")
-            if sym not in watchlist:
+        if _get_state("force_sym"):
+            sym = None
+            with _state_lock:
+                sym = _state.pop("force_sym", None)
+            if sym and sym not in watchlist:
                 watchlist = [sym] + watchlist
                 log.info(f"[comms] Forced {sym} into watchlist")
     log.info(f"Watchlist ({len(watchlist)}): {watchlist}")
 
     # Pause gate
-    if _state["paused"]:
+    if _get_state("paused"):
         log.info("[state] Paused — skipping tick")
         return {"action": "hold", "reason": "paused"}
 
     # 2. Collect ALL data in parallel
     ctx = collect_for_agent(watchlist)
-    ctx_global = ctx
     log.info(f"[collector] {ctx.to_summary().splitlines()[0]} | fetch={ctx.fetch_ms}ms")
     if ctx.errors:
         log.warning(f"[collector] errors: {ctx.errors}")
@@ -518,7 +545,7 @@ def run_once(
     user_msg = build_user_message(opps, ctx, briefing)
 
     # 5. LLM
-    effective_dry = dry_run or _state["dry_run"]
+    effective_dry = dry_run or _get_state("dry_run")
     log.info(f"LLM → provider={os.getenv('LLM_PROVIDER','groq')} dry={effective_dry}")
     raw    = chat_complete(system=system, user=user_msg)
     action = parse_action(raw)
@@ -530,7 +557,7 @@ def run_once(
     # 6. Validate + execute
     if not validate_action(action):
         return {"action": "hold", "reason": "validation_blocked"}
-    execute_action(action, dry_run=effective_dry)
+    execute_action(action, dry_run=effective_dry, ctx=ctx)
 
     # 7. Tick summary to Telegram
     if comms:
@@ -561,8 +588,8 @@ def main() -> None:
     args = parser.parse_args()
 
     manual  = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
-    dry_run = args.dry_run or _state["dry_run"]
-    comms   = TelegramComms()   # singleton; disabled gracefully if not configured
+    dry_run = args.dry_run or _get_state("dry_run")
+    comms   = TelegramComms()
 
     if dry_run:
         log.info("DRY-RUN — no real orders")
@@ -597,7 +624,7 @@ def main() -> None:
             break
         except Exception as e:
             log.error(f"Loop error: {e}")
-        if _state.get("stop"):
+        if _get_state("stop"):
             log.info("Stop requested — exiting.")
             comms.send("🛑 Agent stopped.")
             break

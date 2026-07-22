@@ -3,12 +3,11 @@ Shared Trading Engine
 Used by all strategies as base layer.
 Provides: CLI wrapper, position sizing, ATR calc, logging, Telegram, error handling.
 
-Changes vs previous version:
+Changes:
   - enter() accepts order_type / time_in_force / expiry_seconds
-  - calc_qty() delegates to order_utils.calc_qty_net (fee-aware)
-  - get_free_margin() helper: total_equity - position_margin_in_use
-  - Limit orders include --price arg for bybit-cli
-  - PostOnly / GTC / IOC / GoodTillDate fully wired through
+  - calc_qty() fee-aware + free-margin guard
+  - Bybit V5 TIF: GTC | IOC | FOK | PostOnly only (NO GoodTillDate on /v5/order/create)
+  - Expiry = client-side schedule_cancel via orderLinkId
 """
 import subprocess, json, os, time, statistics, datetime, argparse, sys
 from pathlib import Path
@@ -221,27 +220,35 @@ def zscore(prices, lookback=50):
 
 # --- Position sizing ---
 def calc_qty(stop_distance, risk_pct=None, balance=None, price=None):
-    """Fee-aware fixed-fractional sizing.
-
-    Delegates to order_utils.calc_qty_net so commission is always
-    deducted from the risk budget.  Backward-compatible: existing
-    callers that pass only stop_distance still work.
-    """
+    """Fee-aware sizing with free-margin pre-check."""
     if balance is None:
         balance = get_balance()
+    free = get_free_margin()
+    risk = risk_pct or MAX_RISK_PCT
+
+    # Guard: don't size on total equity when free margin is exhausted
+    if free < balance * risk * 0.5:
+        log_error(
+            f"Insufficient free margin: free={free:.2f} "
+            f"< 50% of risk budget ({balance * risk * 0.5:.2f})"
+        )
+        return 0.001
+
+    # Size on the tighter of total balance vs free margin
+    effective_balance = min(balance, free) if free > 0 else balance
+
     if price is None or price <= 0:
-        # price unknown — fall back to legacy formula
-        if balance <= 0 or stop_distance <= 0:
+        if effective_balance <= 0 or stop_distance <= 0:
             return float(os.getenv("QTY", "0.01"))
-        risk = balance * (risk_pct or MAX_RISK_PCT)
-        return max(round(risk / stop_distance, 3), 0.001)
+        return max(round((effective_balance * risk) / stop_distance, 3), 0.001)
+
     from core.order_utils import calc_qty_net
     return calc_qty_net(
         stop_distance=stop_distance,
-        balance=balance,
-        risk_pct=risk_pct or MAX_RISK_PCT,
+        balance=effective_balance,
+        risk_pct=risk,
         price=price,
-        maker=True,  # assume limit by default
+        maker=True,
     )
 
 def calc_atr_stop(candles, side, atr_mult=1.5):
@@ -292,25 +299,65 @@ def enter(
 ):
     """Enter a position.
 
-    order_type     : 'Limit' (default, maker fee) or 'Market' (taker fee)
-    time_in_force  : 'PostOnly' | 'GTC' | 'IOC' | 'FOK' | 'GoodTillDate'
-    expiry_seconds : if set + Limit order, uses GoodTillDate with this TTL
-    limit_price    : required when order_type='Limit'; pass bid (Buy) or ask (Sell)
-                     from current ticker.  If None, falls back to Market.
+    order_type     : 'Limit' (default, maker) or 'Market' (taker)
+    time_in_force  : 'PostOnly' | 'GTC' | 'IOC' | 'FOK'
+                     (Bybit V5 has NO GoodTillDate on /v5/order/create)
+    expiry_seconds : client-side cancel via schedule_cancel(orderLinkId)
+    limit_price    : required for Limit; if None → fallback Market/IOC
     """
-    from core.order_utils import order_expiry_args
+    from core.order_utils import order_expiry_args, schedule_cancel, VALID_TIF
 
-    # Guard: Limit requires a price
+    # Mainnet hard gate
+    if BYBIT_ENV == "mainnet" and os.getenv("CONFIRM_MAINNET", "").lower() != "yes":
+        log_error("BLOCKED: BYBIT_ENV=mainnet requires CONFIRM_MAINNET=yes")
+        return {"retCode": -1, "retMsg": "mainnet_not_confirmed"}
+
+    # Free-margin pre-check
+    free = get_free_margin()
+    if free <= 0:
+        log_error("BLOCKED: free margin is 0")
+        return {"retCode": -1, "retMsg": "no_free_margin"}
+
+    # Max open orders
+    max_oo = int(os.getenv("MAX_OPEN_ORDERS", "10"))
+    try:
+        oo = cli("order", "realtime", "--category", CATEGORY, "--symbol", SYMBOL)
+        n_open = len(oo.get("result", {}).get("list", []) or [])
+        if n_open >= max_oo:
+            log_error(f"BLOCKED: open_orders={n_open} >= MAX_OPEN_ORDERS={max_oo}")
+            return {"retCode": -1, "retMsg": "max_open_orders"}
+    except Exception:
+        pass
+
+    # Qty guards
+    if qty <= 0:
+        log_error(f"BLOCKED: qty={qty} <= 0")
+        return {"retCode": -1, "retMsg": "qty_invalid"}
+
+    # Limit needs price
     if order_type == "Limit" and limit_price is None:
-        log_info("[enter] limit_price not provided — falling back to Market/IOC")
+        log_info("[enter] limit_price missing — fallback Market/IOC")
         order_type, time_in_force = "Market", "IOC"
 
-    # Close opposite position first
+    # Market always IOC
+    if order_type == "Market":
+        time_in_force = "IOC"
+    elif time_in_force not in VALID_TIF:
+        time_in_force = "PostOnly" if order_type == "Limit" else "IOC"
+
+    # Close opposite
     pos = get_position()
     if pos and pos["side"] != side:
-        log_info(f"Closing opposite {pos['side']} before entering {side}")
+        log_info(f"Closing opposite {pos['side']} before {side}")
         close_position(pos)
         time.sleep(0.5)
+
+    tif_args = order_expiry_args(order_type, time_in_force, expiry_seconds)
+    # Extract orderLinkId for cancel scheduler + audit
+    link_id = ""
+    if "--orderLinkId" in tif_args:
+        i = tif_args.index("--orderLinkId")
+        link_id = tif_args[i + 1]
 
     args = [
         "order", "create",
@@ -321,23 +368,31 @@ def enter(
         "--slTriggerBy", "LastPrice",
         "--cap-usd", CAP_USD, "--yes",
     ]
-
     if order_type == "Limit" and limit_price is not None:
         args += ["--price", str(round(limit_price, 2))]
-
-    # timeInForce + optional expiry
-    args += order_expiry_args(order_type, time_in_force, expiry_seconds)
-
+    args += tif_args
     if take_profit:
         args += ["--takeProfit", str(take_profit), "--tpTriggerBy", "LastPrice"]
 
+    log_info(f"[enter] audit linkId={link_id} {side} {order_type}/{time_in_force} qty={qty}")
     result = cli(*args)
+
+    # Client-side expiry (replaces GoodTillDate)
+    if (
+        result.get("retCode") == 0
+        and expiry_seconds
+        and expiry_seconds > 0
+        and link_id
+        and order_type == "Limit"
+    ):
+        schedule_cancel(link_id, expiry_seconds, category=CATEGORY, symbol=SYMBOL)
+
     price = closes(get_klines(limit=1))[-1] if result.get("retCode") == 0 else 0
     log_trade("ENTER", side, qty, price, stop_loss, result, reason)
     alert(
-        f"\u23f5 {order_type} {side} {SYMBOL} qty={qty} "
+        f"▶ {order_type} {side} {SYMBOL} qty={qty} "
         f"sl={stop_loss} tp={take_profit or 'none'} "
-        f"tif={time_in_force} | {reason}"
+        f"tif={time_in_force} link={link_id} | {reason}"
     )
     return result
 
@@ -392,15 +447,32 @@ def safety_check(max_daily_loss_pct=0.03):
         data = cli("position", "closed-pnl", "--category", CATEGORY, "--limit", "50")
         trades = data.get("result", {}).get("list", [])
         today = datetime.date.today().strftime("%Y%m%d")
-        today_pnl = sum(float(t["closedPnl"]) for t in trades if t.get("updatedTime", "")[:8] == today)
+
+        def _trade_day(t) -> str:
+            raw = t.get("updatedTime", "0")
+            try:
+                ts_ms = int(raw)
+                return datetime.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y%m%d")
+            except (TypeError, ValueError, OSError):
+                # legacy fallback if ever YYYYMMDD...
+                return str(raw)[:8]
+
+        today_pnl = sum(
+            float(t["closedPnl"]) for t in trades if _trade_day(t) == today
+        )
         balance = get_balance()
         loss_pct = abs(today_pnl) / balance if balance > 0 and today_pnl < 0 else 0
         if loss_pct > max_daily_loss_pct:
-            log_error(f"Daily loss {loss_pct:.2%} > {max_daily_loss_pct:.2%}. Activating kill-switch.")
-            alert(f"\u26a0\ufe0f KILL-SWITCH: daily loss {loss_pct:.2%} exceeded threshold")
+            log_error(
+                f"Daily loss {loss_pct:.2%} > {max_daily_loss_pct:.2%}. Kill-switch."
+            )
+            alert(f"⚠️ KILL-SWITCH: daily loss {loss_pct:.2%} exceeded")
             cli("kill-switch")
             return False
-        log_info(f"Safety OK | daily_pnl={today_pnl:.4f} USDT ({loss_pct:.2%}) | balance={balance:.2f}")
+        log_info(
+            f"Safety OK | daily_pnl={today_pnl:.4f} USDT "
+            f"({loss_pct:.2%}) | balance={balance:.2f}"
+        )
         return True
     except Exception as e:
         log_error(f"Safety check failed: {e}")
