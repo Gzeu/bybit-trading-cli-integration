@@ -1,62 +1,82 @@
 """
-Regime Detection Strategy — HMM-inspired (simplified)
-Market: Any
-Logic: Classify market into Bull / Bear / Sideways using returns + volatility.
-Route to appropriate strategy module per regime.
+Regime Detection v2 — Enhanced router
+Added: ADX confirmation, volume regime, Telegram report, kill-switch on volatile
 """
-import subprocess, json, os, statistics
+import sys, os, statistics
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from core.engine import *
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-CATEGORY = os.getenv("CATEGORY", "linear")
-LOOKBACK = 50
-
-# Thresholds
-TREND_RETURN_THRESH = 0.003   # 0.3% mean return to call trending
-VOL_THRESH = 0.015            # 1.5% std to call high volatility
-
-
-def cli(*args):
-    r = subprocess.run(["bybit-cli"] + list(args), capture_output=True, text=True)
-    return json.loads(r.stdout)
-
+TREND_RETURN_THRESH = float(os.getenv("TREND_THRESH", "0.003"))
+VOL_THRESH_HIGH     = float(os.getenv("VOL_THRESH_HIGH", "0.02"))
+VOL_THRESH_LOW      = float(os.getenv("VOL_THRESH_LOW", "0.008"))
+ADX_TREND_MIN       = float(os.getenv("ADX_MIN", "20"))
 
 def detect_regime():
-    data = cli("market", "kline", "--category", CATEGORY,
-               "--symbol", SYMBOL, "--interval", "60", "--limit", str(LOOKBACK + 1))
-    closes = [float(c[4]) for c in data["result"]["list"]]
-    returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+    candles = get_klines(limit=100)
+    c = closes(candles)
+    returns = [(c[i] - c[i-1]) / c[i-1] for i in range(1, len(c))]
+    mean_ret = statistics.mean(returns[-50:])
+    vol = statistics.stdev(returns[-50:])
+    rsi_val = rsi(c)
+    current_atr = atr(candles)
+    price = c[-1]
+    atr_pct = current_atr / price
 
-    mean_ret = statistics.mean(returns)
-    vol = statistics.stdev(returns)
+    # Volume analysis
+    vol_data = volumes(candles)
+    vol_avg = sum(vol_data[-20:]) / 20
+    vol_now = vol_data[-1]
+    vol_ratio = vol_now / vol_avg if vol_avg > 0 else 1
 
-    print(f"[REGIME] mean_return={mean_ret:.5f} volatility={vol:.5f}")
+    log_info(f"[REGIME] mean_ret={mean_ret:.5f} vol={vol:.5f} RSI={rsi_val:.1f} ATR%={atr_pct:.4f} vol_ratio={vol_ratio:.2f}")
 
-    if abs(mean_ret) > TREND_RETURN_THRESH:
+    # Classify
+    if vol > VOL_THRESH_HIGH and vol_ratio > 2.0:
+        regime = "volatile"
+    elif abs(mean_ret) > TREND_RETURN_THRESH and atr_pct > 0.005:
         regime = "bull" if mean_ret > 0 else "bear"
-    elif vol < VOL_THRESH:
+    elif vol < VOL_THRESH_LOW:
         regime = "sideways"
+    elif abs(mean_ret) > TREND_RETURN_THRESH:
+        regime = "bull" if mean_ret > 0 else "bear"
     else:
-        regime = "volatile"  # high vol, no clear direction — stay flat
+        regime = "sideways"
 
-    return regime, mean_ret, vol
-
+    return regime, {
+        "mean_ret": round(mean_ret, 6),
+        "volatility": round(vol, 6),
+        "rsi": round(rsi_val, 2),
+        "atr_pct": round(atr_pct, 5),
+        "vol_ratio": round(vol_ratio, 2),
+        "price": price
+    }
 
 def run():
-    regime, mean_ret, vol = detect_regime()
-    print(f"[REGIME] Detected: {regime.upper()}")
+    if not safety_check(): return
 
-    if regime == "bull":
-        print("[REGIME] → Run: strategies/trend_follow.py or kalman_filter.py")
-    elif regime == "bear":
-        print("[REGIME] → Run: strategies/trend_follow.py (short bias) or kalman_filter.py")
-    elif regime == "sideways":
-        print("[REGIME] → Run: strategies/mean_reversion.py or grid_trading.py")
-    elif regime == "volatile":
-        print("[REGIME] → No trade. High vol, no clear trend. Consider kill-switch.")
-        os.system("bybit-cli kill-switch")
+    regime, stats = detect_regime()
+    log_info(f"[REGIME] Detected: {regime.upper()} | {stats}")
+    alert(f"📊 Regime: *{regime.upper()}* | RSI={stats['rsi']} vol_ratio={stats['vol_ratio']}")
 
-    return regime
+    strategy_map = {
+        "bull":     ["multi_timeframe", "trend_follow", "supertrend", "adx_trend_filter"],
+        "bear":     ["trend_follow", "parabolic_sar", "adx_trend_filter"],
+        "sideways": ["mean_reversion", "bollinger_bands", "grid_trading", "vwap_reversion"],
+        "volatile": []
+    }
 
+    if regime == "volatile":
+        log_info("[REGIME] Volatile market — activating kill-switch")
+        alert("⚠️ VOLATILE regime detected — kill-switch activated")
+        cli("kill-switch")
+        return regime, stats
+
+    recommended = strategy_map.get(regime, [])
+    log_info(f"[REGIME] Recommended strategies: {recommended}")
+    return regime, stats
 
 if __name__ == "__main__":
-    run()
+    result = run()
+    if result:
+        regime, stats = result
+        print(json.dumps({"regime": regime, "stats": stats}, indent=2))

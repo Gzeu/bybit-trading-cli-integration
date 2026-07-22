@@ -1,63 +1,55 @@
 """
-Mean Reversion Strategy — Z-score
-Market: Spot or Linear Futures
-Logic: Enter when z-score > 2 (short) or < -2 (long), exit near 0
+Mean Reversion Strategy v2 — Z-score
+Improved: ATR stop, dynamic sizing, RSI filter, volume filter, logging
 """
-import subprocess, json, os, statistics
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from core.engine import *
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-CATEGORY = os.getenv("CATEGORY", "linear")
-QTY = os.getenv("QTY", "0.01")
-LOOKBACK = 50
-ENTRY_Z = 2.0
-EXIT_Z = 0.5
-
-
-def cli(*args):
-    r = subprocess.run(["bybit-cli"] + list(args), capture_output=True, text=True)
-    return json.loads(r.stdout)
-
-
-def get_closes(limit=100):
-    data = cli("market", "kline", "--category", CATEGORY,
-               "--symbol", SYMBOL, "--interval", "60", "--limit", str(limit))
-    return [float(c[4]) for c in data["result"]["list"]]
-
-
-def zscore(prices):
-    window = prices[-LOOKBACK:]
-    mean = statistics.mean(window)
-    std = statistics.stdev(window)
-    return (prices[-1] - mean) / std if std > 0 else 0
-
+LOOKBACK   = int(os.getenv("LOOKBACK", "50"))
+ENTRY_Z    = float(os.getenv("ENTRY_Z", "2.0"))
+EXIT_Z     = float(os.getenv("EXIT_Z", "0.5"))
+ATR_MULT   = float(os.getenv("ATR_MULT", "1.0"))
+RSI_FILTER = True  # only enter if RSI confirms
 
 def run():
-    closes = get_closes()
-    z = zscore(closes)
-    print(f"[MEAN-REV] z-score={z:.3f}")
+    if not safety_check(): return
 
-    pos = cli("position", "info", "--category", CATEGORY, "--symbol", SYMBOL)
-    side = pos["result"]["list"][0]["side"] if pos["result"]["list"] else "None"
+    candles = get_klines(limit=200)
+    c = closes(candles)
+    z = zscore(c, LOOKBACK)
+    current_atr = atr(candles)
+    price = c[-1]
+    rsi_val = rsi(c)
+    vol = volumes(candles)
+    avg_vol = sum(vol[-20:]) / 20
+    high_vol = vol[-1] > avg_vol * 0.8  # at least 80% avg volume
 
-    if z > ENTRY_Z and side != "Sell":
-        print("[MEAN-REV] Overbought — SHORT")
-        cli("order", "create", "--category", CATEGORY, "--symbol", SYMBOL,
-            "--side", "Sell", "--orderType", "Market", "--qty", QTY,
-            "--cap-usd", "500", "--yes")
+    log_info(f"[MEAN-REV] price={price:.2f} z={z:.3f} RSI={rsi_val:.1f} vol_ok={high_vol}")
 
-    elif z < -ENTRY_Z and side != "Buy":
-        print("[MEAN-REV] Oversold — LONG")
-        cli("order", "create", "--category", CATEGORY, "--symbol", SYMBOL,
-            "--side", "Buy", "--orderType", "Market", "--qty", QTY,
-            "--cap-usd", "500", "--yes")
+    pos = get_position()
 
-    elif abs(z) < EXIT_Z and side in ("Buy", "Sell"):
-        close_side = "Sell" if side == "Buy" else "Buy"
-        print(f"[MEAN-REV] z near 0 — closing {side}")
-        cli("order", "create", "--category", CATEGORY, "--symbol", SYMBOL,
-            "--side", close_side, "--orderType", "Market", "--qty", QTY,
-            "--reduceOnly", "true", "--yes")
+    if z < -ENTRY_Z and (not RSI_FILTER or rsi_val < 45) and high_vol:
+        if pos is None or pos["side"] == "Sell":
+            sl = round(price - ATR_MULT * current_atr, 2)
+            tp = round(price + abs(z) * current_atr, 2)  # TP scales with z-score
+            qty = calc_qty(stop_distance=price - sl)
+            enter("Buy", qty, sl, tp, reason=f"Z={z:.2f} RSI={rsi_val:.1f} oversold")
 
+    elif z > ENTRY_Z and (not RSI_FILTER or rsi_val > 55) and high_vol:
+        if pos is None or pos["side"] == "Buy":
+            sl = round(price + ATR_MULT * current_atr, 2)
+            tp = round(price - abs(z) * current_atr, 2)
+            qty = calc_qty(stop_distance=sl - price)
+            enter("Sell", qty, sl, tp, reason=f"Z={z:.2f} RSI={rsi_val:.1f} overbought")
+
+    elif abs(z) < EXIT_Z and pos:
+        log_info(f"[MEAN-REV] Z near 0 — closing {pos['side']}")
+        close_position(pos)
+        alert(f"⏹ Closed {pos['side']} {SYMBOL} | Z returned to {z:.2f}")
+
+    else:
+        log_info(f"[MEAN-REV] No signal")
 
 if __name__ == "__main__":
     run()

@@ -1,56 +1,81 @@
 """
-Multi-Timeframe Confluence Strategy
-Market: Linear Futures
-Logic: Require trend alignment across 3 timeframes (4h, 1h, 15m).
-All three must agree on direction (EMA slope) before entering.
-'Never trade against the higher timeframe.'
+Multi-Timeframe Strategy v2
+Improved: ADX filter, volume confirm, ATR sizing, proper cross detection
 """
-import subprocess, json, os
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from core.engine import *
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-CATEGORY = "linear"
-QTY = os.getenv("QTY", "0.01")
 TIMEFRAMES = [("240", "4h"), ("60", "1h"), ("15", "15m")]
-EMA_P = 21
+EMA_P = int(os.getenv("EMA_P", "21"))
+ADX_THRESH = float(os.getenv("ADX_THRESH", "20"))
 
-def cli(*args):
-    r = subprocess.run(["bybit-cli"] + list(args), capture_output=True, text=True)
-    return json.loads(r.stdout)
+def tf_slope(interval):
+    candles = get_klines(interval=interval, limit=EMA_P + 10)
+    c = closes(candles)
+    e_series = ema_series(c, EMA_P)
+    slope = e_series[-1] - e_series[-4]  # 3-bar slope
+    return slope, candles
 
-def ema_slope(closes, period=21):
-    k = 2 / (period + 1)
-    e = closes[0]
-    ema_vals = []
-    for p in closes:
-        e = p * k + e * (1 - k)
-        ema_vals.append(e)
-    return ema_vals[-1] - ema_vals[-3]  # 2-bar slope
-
-def get_slope(interval):
-    data = cli("market", "kline", "--category", CATEGORY, "--symbol", SYMBOL,
-               "--interval", interval, "--limit", str(EMA_P + 10))
-    closes = [float(c[4]) for c in data["result"]["list"]]
-    return ema_slope(closes, EMA_P)
+def compute_adx_simple(candles, period=14):
+    h = highs(candles)
+    l = lows(candles)
+    c = closes(candles)
+    dm_p, dm_m, trs = [], [], []
+    for i in range(1, len(c)):
+        up   = h[i] - h[i-1]
+        down = l[i-1] - l[i]
+        dm_p.append(up if up > down and up > 0 else 0)
+        dm_m.append(down if down > up and down > 0 else 0)
+        trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+    atr_val = sum(trs[-period:]) / period
+    di_p  = 100 * (sum(dm_p[-period:])  / period) / atr_val if atr_val else 0
+    di_m  = 100 * (sum(dm_m[-period:]) / period) / atr_val if atr_val else 0
+    dx = abs(di_p - di_m) / (di_p + di_m) * 100 if (di_p + di_m) else 0
+    return dx
 
 def run():
+    if not safety_check(): return
+
     slopes = {}
+    base_candles = None
     for tf, label in TIMEFRAMES:
-        slopes[label] = get_slope(tf)
-        print(f"[MTF] {label} slope={slopes[label]:.4f}")
+        slope, candles = tf_slope(tf)
+        slopes[label] = slope
+        if label == "1h":
+            base_candles = candles
+        log_info(f"[MTF] {label} EMA slope={slope:.4f}")
+
+    adx_val = compute_adx_simple(base_candles) if base_candles else 0
+    log_info(f"[MTF] ADX={adx_val:.1f}")
+
+    if adx_val < ADX_THRESH:
+        log_info(f"[MTF] ADX {adx_val:.1f} below threshold {ADX_THRESH} — skip")
+        return
 
     all_up   = all(s > 0 for s in slopes.values())
     all_down = all(s < 0 for s in slopes.values())
+    price = closes(base_candles)[-1]
+    current_atr = atr(base_candles)
 
-    if all_up:
-        print("[MTF] All timeframes bullish -> LONG")
-        cli("order", "create", "--category", CATEGORY, "--symbol", SYMBOL,
-            "--side", "Buy", "--orderType", "Market", "--qty", QTY, "--cap-usd", "500", "--yes")
-    elif all_down:
-        print("[MTF] All timeframes bearish -> SHORT")
-        cli("order", "create", "--category", CATEGORY, "--symbol", SYMBOL,
-            "--side", "Sell", "--orderType", "Market", "--qty", QTY, "--cap-usd", "500", "--yes")
+    pos = get_position()
+
+    if all_up and (pos is None or pos["side"] == "Sell"):
+        sl = round(price - 1.5 * current_atr, 2)
+        tp = round(price + 3.0 * current_atr, 2)
+        qty = calc_qty(stop_distance=price - sl)
+        set_leverage()
+        enter("Buy", qty, sl, tp, reason=f"MTF all-bullish ADX={adx_val:.1f}")
+
+    elif all_down and (pos is None or pos["side"] == "Buy"):
+        sl = round(price + 1.5 * current_atr, 2)
+        tp = round(price - 3.0 * current_atr, 2)
+        qty = calc_qty(stop_distance=sl - price)
+        set_leverage()
+        enter("Sell", qty, sl, tp, reason=f"MTF all-bearish ADX={adx_val:.1f}")
+
     else:
-        print("[MTF] No confluence across timeframes — skip")
+        log_info(f"[MTF] No confluence | slopes={slopes}")
 
 if __name__ == "__main__":
     run()

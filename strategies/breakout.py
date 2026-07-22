@@ -1,65 +1,56 @@
 """
-Breakout Strategy — ATR-based
-Market: Linear Futures
-Logic: Enter on confirmed candle close beyond ATR bands
+Breakout Strategy v2 — ATR-based + volume confirmation
+Improved: volume filter, multi-candle confirmation, R:R >= 2, dynamic sizing
 """
-import subprocess, json, os, math
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from core.engine import *
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-CATEGORY = "linear"
-QTY = os.getenv("QTY", "0.01")
-ATR_PERIOD = 14
-ATR_MULT = 1.5
-
-
-def cli(*args):
-    r = subprocess.run(["bybit-cli"] + list(args), capture_output=True, text=True)
-    return json.loads(r.stdout)
-
-
-def compute_atr(candles):
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = float(candles[i][2]), float(candles[i][3]), float(candles[i-1][4])
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    atr = sum(trs[-ATR_PERIOD:]) / ATR_PERIOD
-    return atr
-
+ATR_MULT   = float(os.getenv("ATR_MULT", "1.5"))
+RR_RATIO   = float(os.getenv("RR_RATIO", "2.0"))  # min reward:risk
+CONFIRM_CANDLES = int(os.getenv("CONFIRM_CANDLES", "2"))  # candles must close beyond band
 
 def run():
-    data = cli("market", "kline", "--category", CATEGORY,
-               "--symbol", SYMBOL, "--interval", "60", "--limit", "50")
-    candles = data["result"]["list"]
-    atr = compute_atr(candles)
-    last_close = float(candles[-1][4])
-    prev_close = float(candles[-2][4])
+    if not safety_check(): return
 
-    upper = prev_close + ATR_MULT * atr
-    lower = prev_close - ATR_MULT * atr
-    print(f"[BREAKOUT] close={last_close} upper={upper:.2f} lower={lower:.2f} ATR={atr:.2f}")
+    candles = get_klines(limit=100)
+    c = closes(candles)
+    current_atr = atr(candles)
+    price = c[-1]
+    prev_close = c[-2]
 
-    if last_close > upper:
-        sl = round(last_close - atr, 2)
-        tp = round(last_close + atr * 2, 2)
-        print(f"[BREAKOUT] Upside breakout — LONG | SL={sl} TP={tp}")
-        cli("order", "create",
-            "--category", CATEGORY, "--symbol", SYMBOL,
-            "--side", "Buy", "--orderType", "Market", "--qty", QTY,
-            "--stopLoss", str(sl), "--takeProfit", str(tp),
-            "--cap-usd", "500", "--yes")
+    upper_band = prev_close + ATR_MULT * current_atr
+    lower_band = prev_close - ATR_MULT * current_atr
 
-    elif last_close < lower:
-        sl = round(last_close + atr, 2)
-        tp = round(last_close - atr * 2, 2)
-        print(f"[BREAKOUT] Downside breakout — SHORT | SL={sl} TP={tp}")
-        cli("order", "create",
-            "--category", CATEGORY, "--symbol", SYMBOL,
-            "--side", "Sell", "--orderType", "Market", "--qty", QTY,
-            "--stopLoss", str(sl), "--takeProfit", str(tp),
-            "--cap-usd", "500", "--yes")
+    # Volume confirmation
+    vol = volumes(candles)
+    avg_vol = sum(vol[-20:]) / 20
+    vol_ok = vol[-1] > avg_vol * 1.2  # breakout needs 20%+ above avg volume
+
+    # Multi-candle confirmation
+    above_band = all(c[-(i+1)] > upper_band for i in range(CONFIRM_CANDLES))
+    below_band = all(c[-(i+1)] < lower_band for i in range(CONFIRM_CANDLES))
+
+    log_info(f"[BREAKOUT] price={price:.2f} upper={upper_band:.2f} lower={lower_band:.2f} ATR={current_atr:.2f} vol_ok={vol_ok}")
+
+    pos = get_position()
+
+    if above_band and vol_ok and (pos is None or pos["side"] == "Sell"):
+        sl = round(price - current_atr, 2)
+        stop_dist = price - sl
+        tp = round(price + stop_dist * RR_RATIO, 2)
+        qty = calc_qty(stop_distance=stop_dist)
+        enter("Buy", qty, sl, tp, reason=f"Upside breakout ATR={current_atr:.0f} vol={vol[-1]:.0f}")
+
+    elif below_band and vol_ok and (pos is None or pos["side"] == "Buy"):
+        sl = round(price + current_atr, 2)
+        stop_dist = sl - price
+        tp = round(price - stop_dist * RR_RATIO, 2)
+        qty = calc_qty(stop_distance=stop_dist)
+        enter("Sell", qty, sl, tp, reason=f"Downside breakout ATR={current_atr:.0f} vol={vol[-1]:.0f}")
+
     else:
-        print("[BREAKOUT] No breakout confirmed")
-
+        log_info(f"[BREAKOUT] No confirmed breakout (vol_ok={vol_ok})")
 
 if __name__ == "__main__":
     run()
