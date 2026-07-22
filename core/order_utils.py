@@ -5,27 +5,32 @@ core/order_utils.py — Order type selection, fee-aware sizing, expiry helpers
 All trading decisions about HOW to place an order live here:
   - Which order type (Limit / Market)
   - Which timeInForce (PostOnly / GTC / IOC / FOK)
-  - Expiry logic (orderLinkId + GoodTillDate via expirySeconds)
+  - Expiry logic: client-side cancel scheduler (Bybit V5 has NO GoodTillDate
+    on /v5/order/create for linear futures — orderExpiry param does NOT exist)
   - Fee-aware position sizing (commission deducted from risk budget)
 
 Import from anywhere:
     from core.order_utils import (
         calc_qty_net, calc_qty_balance,
-        choose_order_type, order_expiry_args,
+        choose_order_type, order_expiry_args, schedule_cancel,
         commission_cost, net_min_move,
     )
 
-Bybit V5 linear futures fee schedule (as of 2025):
+Bybit V5 linear futures fee schedule (as of 2026):
   Maker (Limit + PostOnly): 0.020%   <- we target this always
   Taker (Market / IOC fill): 0.055%
   Round-trip target:         0.040%  (maker+maker, both sides limit)
   Round-trip worst-case:     0.110%  (market+market)
+
+Bybit V5 valid timeInForce values for linear futures:
+  GTC | IOC | FOK | PostOnly   (GoodTillDate is NOT supported on /v5/order/create)
 """
 from __future__ import annotations
 
 import os
 import uuid
 import time
+import threading
 from typing import Literal
 
 # ---------------------------------------------------------------------------
@@ -39,6 +44,10 @@ FEE_RT_WORST= FEE_TAKER * 2                               # 0.110% round-trip ta
 
 # Minimum spread (%) below which we attempt PostOnly limit orders
 LIMIT_SPREAD_THRESHOLD = float(os.getenv("LIMIT_SPREAD_THRESHOLD", "0.05"))  # 0.05%
+
+# Valid timeInForce values on Bybit V5 /v5/order/create (linear)
+# GoodTillDate is NOT in this list — expiry is handled client-side via schedule_cancel()
+VALID_TIF: frozenset[str] = frozenset({"GTC", "IOC", "FOK", "PostOnly"})
 
 # ---------------------------------------------------------------------------
 # Fee calculations
@@ -143,18 +152,18 @@ def choose_order_type(
     """Decide order type and timeInForce.
 
     Rules (in priority order):
-      1. urgency=True                 → Market  / IOC   (breakout, liquidation)
-      2. spread > LIMIT_SPREAD_THRESHOLD → Market / GTC  (spread too wide for limit)
-      3. strategy_hint == 'scalping'  → Market  / IOC   (need immediate fill)
+      1. urgency=True                    → Market / IOC   (breakout, liquidation)
+      2. spread > LIMIT_SPREAD_THRESHOLD → Market / IOC   (spread too wide for limit)
+      3. strategy_hint == 'scalping'     → Market / IOC   (need immediate fill)
       4. strategy_hint == 'mean_reversion' / 'bollinger' / 'vwap' → Limit / PostOnly
-      5. default                      → Limit   / PostOnly
+      5. default                         → Limit  / PostOnly
 
     Returns (order_type, time_in_force)
     """
     if urgency:
         return "Market", "IOC"
     if spread_pct > LIMIT_SPREAD_THRESHOLD:
-        return "Market", "GTC"
+        return "Market", "IOC"
     if strategy_hint in {"scalping", "liquidation_hunt"}:
         return "Market", "IOC"
     # Everything else: try maker limit
@@ -167,38 +176,63 @@ def choose_order_type(
 
 def order_expiry_args(
     order_type: OrderType,
-    time_in_force: TIF,
+    time_in_force: str,
     expiry_seconds: int | None = None,
 ) -> list[str]:
-    """Build the extra CLI args for timeInForce and optional expiry.
+    """Build the extra CLI args for timeInForce and orderLinkId.
 
-    Bybit supports:
-      - PostOnly  : maker-only limit; rejected if would match immediately
-      - GTC       : Good Till Cancel (default)
-      - IOC       : Immediate Or Cancel  (fill what's available, cancel rest)
-      - FOK       : Fill Or Kill         (all or nothing)
-      - GoodTillDate: cancel after timestamp (pass via orderFilter + expiryDate)
+    IMPORTANT: Bybit V5 /v5/order/create does NOT support GoodTillDate or
+    --orderExpiry for linear futures. Valid timeInForce values are:
+        GTC | IOC | FOK | PostOnly
 
-    For Limit + PostOnly this returns:
-        ["--timeInForce", "PostOnly", "--orderLinkId", "<uuid>"]
+    Order expiry is handled client-side via schedule_cancel() which cancels
+    the order after N seconds using the orderLinkId.
 
-    For expiry_seconds (e.g. 300 = cancel after 5 min):
-        also appends ["--timeInForce", "GoodTillDate", "--orderExpiry", "<ts_ms>"]
-
-    The orderLinkId is a per-order UUID so we can cancel by linkId if needed.
+    The orderLinkId (≤36 chars) is a per-order ID so we can cancel by linkId.
     """
-    args: list[str] = []
-    link_id = f"bot_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-    args += ["--orderLinkId", link_id]
+    link_id = f"bot_{int(time.time())}_{uuid.uuid4().hex[:8]}"  # ~24 chars, well under 36
 
-    if expiry_seconds and order_type == "Limit":
-        # GoodTillDate — absolute timestamp in milliseconds
-        expiry_ms = str(int((time.time() + expiry_seconds) * 1000))
-        args += ["--timeInForce", "GoodTillDate", "--orderExpiry", expiry_ms]
-    else:
-        args += ["--timeInForce", time_in_force]
+    # Enforce valid TIF — never pass GoodTillDate to the API
+    tif = time_in_force if time_in_force in VALID_TIF else "GTC"
+    # Market orders must always use IOC on Bybit
+    if order_type == "Market":
+        tif = "IOC"
 
-    return args
+    return ["--orderLinkId", link_id, "--timeInForce", tif]
+
+
+def schedule_cancel(order_link_id: str, expiry_seconds: int,
+                    category: str | None = None, symbol: str | None = None) -> None:
+    """Client-side order expiry: cancel order after N seconds if still open.
+
+    This replaces the invalid GoodTillDate API param. The cancel is attempted
+    via bybit-cli using the orderLinkId. Runs in a daemon thread so it never
+    blocks the main loop.
+
+    Args:
+        order_link_id:   The orderLinkId used when placing the order.
+        expiry_seconds:  Seconds to wait before attempting cancel.
+        category:        Override category (default from env BYBIT_CATEGORY).
+        symbol:          Override symbol (default from env SYMBOL).
+    """
+    if not expiry_seconds or expiry_seconds <= 0:
+        return
+
+    def _cancel() -> None:
+        time.sleep(expiry_seconds)
+        try:
+            _cat = category or os.getenv("BYBIT_CATEGORY", "linear")
+            _sym = symbol or os.getenv("SYMBOL", "BTCUSDT")
+            from core.engine import cli  # local import to avoid circular
+            cli("order", "cancel",
+                "--category", _cat,
+                "--symbol", _sym,
+                "--orderLinkId", order_link_id,
+                "--yes")
+        except Exception:
+            pass  # order may already be filled/cancelled — ignore
+
+    threading.Thread(target=_cancel, daemon=True, name=f"cancel_{order_link_id}").start()
 
 
 # ---------------------------------------------------------------------------
@@ -243,11 +277,12 @@ class OrderParams:
         leverage: int = 1,
     ) -> "OrderParams":
         order_type, tif = choose_order_type(spread_pct, urgency, strategy_hint)
+        # Normalize side capitalization (defensive guard)
+        side = side.capitalize()
         maker = order_type == "Limit"
         qty   = calc_qty_net(stop_distance, balance, risk_pct, price, maker=maker)
         comm  = commission_cost(qty, price, maker=maker, sides=2)
         mmove = net_min_move(price, maker_entry=maker, maker_exit=maker)
-        sl_pct= stop_distance / price
         # Reject if stop < break-even (fees eat the whole stop)
         if stop_distance < mmove * 1.5:
             import warnings
@@ -256,8 +291,9 @@ class OrderParams:
                 "trade has negative expected value after fees",
                 stacklevel=2,
             )
+        sl_price = (price - stop_distance) if side == "Buy" else (price + stop_distance)
         return cls(
-            side=side, qty=qty, sl_price=price - stop_distance if side=="Buy" else price + stop_distance,
+            side=side, qty=qty, sl_price=sl_price,
             order_type=order_type, tif=tif,
             expiry_seconds=expiry_seconds,
             commission_usdt=comm, min_move=mmove,
