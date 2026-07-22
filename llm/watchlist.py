@@ -40,9 +40,9 @@ from core.engine import cli, log_info, log_error
 
 DEFAULT_CATEGORY  = os.getenv("WATCHLIST_CATEGORY",      "linear")
 DEFAULT_TOP_N     = int(os.getenv("WATCHLIST_TOP_N",     "15"))
-DEFAULT_MIN_VOL   = float(os.getenv("WATCHLIST_MIN_VOL_USD",   "10000000"))  # 10M USDT
-DEFAULT_MAX_SPREAD= float(os.getenv("WATCHLIST_MAX_SPREAD_PCT", "0.1"))      # 0.1%
-DEFAULT_MIN_CHANGE= float(os.getenv("WATCHLIST_MIN_CHANGE_PCT", "0.5"))      # 0.5% 24h move
+DEFAULT_MIN_VOL   = float(os.getenv("WATCHLIST_MIN_VOL_USD",    "10000000"))  # 10M USDT
+DEFAULT_MAX_SPREAD= float(os.getenv("WATCHLIST_MAX_SPREAD_PCT",  "0.1"))      # 0.1%
+DEFAULT_MIN_CHANGE= float(os.getenv("WATCHLIST_MIN_CHANGE_PCT",  "0.5"))      # 0.5% 24h move
 DEFAULT_QUOTE     = os.getenv("WATCHLIST_QUOTE", "USDT")
 
 # 30s default — one refresh per agent tick at 30s intervals.
@@ -129,15 +129,26 @@ def _safe_float(val, default: float = 0.0) -> float:
         return default
 
 
-def _fetch_and_score(category: str, top_n: int) -> tuple[list[str], list[dict]]:
-    """Fetch all tickers from Bybit, filter + score, return (symbols, detail)."""
+def _fetch_and_score(
+    category: str,
+    top_n: int,
+    min_vol: float    = DEFAULT_MIN_VOL,
+    max_spread: float = DEFAULT_MAX_SPREAD,
+    min_change: float = DEFAULT_MIN_CHANGE,
+) -> tuple[list[str], list[dict]]:
+    """Fetch all tickers from Bybit, filter + score, return (symbols, detail).
+
+    Filter thresholds are explicit parameters — module-level DEFAULT_* globals
+    are never mutated.  This makes the function safe to call from tests or
+    CLI without polluting the shared module state.
+    """
     data  = cli("market", "tickers", "--category", category)
     items = data.get("result", {}).get("list", [])
     log_info(f"[watchlist] fetched {len(items)} tickers ({category})")
 
     scored: list[dict] = []
     for t in items:
-        s = _score_ticker(t)
+        s = _score_ticker(t, min_vol=min_vol, max_spread=max_spread, min_change=min_change)
         if s:
             scored.append(s)
 
@@ -151,7 +162,12 @@ def _fetch_and_score(category: str, top_n: int) -> tuple[list[str], list[dict]]:
     return symbols, scored
 
 
-def _score_ticker(t: dict) -> dict | None:
+def _score_ticker(
+    t: dict,
+    min_vol: float    = DEFAULT_MIN_VOL,
+    max_spread: float = DEFAULT_MAX_SPREAD,
+    min_change: float = DEFAULT_MIN_CHANGE,
+) -> dict | None:
     symbol  = t.get("symbol", "")
     if not symbol.endswith(DEFAULT_QUOTE):  return None
     if symbol in BLACKLIST:                 return None
@@ -169,10 +185,10 @@ def _score_ticker(t: dict) -> dict | None:
     oi        = _safe_float(t.get("openInterestValue"))
     spread    = (ask - bid) / price * 100 if bid > 0 and ask > 0 else 999.0
 
-    # Hard filters
-    if vol_usd < DEFAULT_MIN_VOL:                                  return None
-    if spread  > DEFAULT_MAX_SPREAD:                               return None
-    if abs(chg_pct) * 100 < DEFAULT_MIN_CHANGE \
+    # Hard filters (use explicit params, NOT module globals)
+    if vol_usd < min_vol:                                          return None
+    if spread  > max_spread:                                       return None
+    if abs(chg_pct) * 100 < min_change \
        and symbol not in ALWAYS_INCLUDE:                           return None
 
     # Score
@@ -315,12 +331,19 @@ if __name__ == "__main__":
     parser.add_argument("--force",      action="store_true")
     args = parser.parse_args()
 
-    DEFAULT_MIN_VOL    = args.min_vol
-    DEFAULT_MAX_SPREAD = args.max_spread
-    DEFAULT_MIN_CHANGE = args.min_change
-
-    symbols = build_watchlist(top_n=args.top, category=args.category, force=args.force)
-    detail  = get_detail()
+    # FIX #3: pass CLI args explicitly — do NOT overwrite module-level globals.
+    # This keeps DEFAULT_* safe if watchlist.py is imported in the same process.
+    symbols, detail = _fetch_and_score(
+        category=args.category,
+        top_n=args.top,
+        min_vol=args.min_vol,
+        max_spread=args.max_spread,
+        min_change=args.min_change,
+    )
+    # Inject ALWAYS_INCLUDE anchors
+    for sym in ALWAYS_INCLUDE:
+        if sym not in symbols:
+            symbols.append(sym)
 
     if args.json:
         print(json.dumps({"symbols": symbols, "detail": detail[:args.top]}, indent=2))
