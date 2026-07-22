@@ -1,56 +1,111 @@
 """
-Trend Following Strategy v2 — EMA Crossover
-Improved: dynamic sizing, ATR stop, close opposite, logging, Telegram, safety check
+Trend Follow — EMA crossover with fee-aware sizing and Limit PostOnly orders.
+
+Order logic:
+  - Uses Limit PostOnly (maker fee 0.020%) unless spread > threshold
+  - GTC with 10-minute expiry: if not filled in 600s, cancels automatically
+  - Sizing: calc_qty_net deducts round-trip commission from risk budget
+  - Skips if expected move < 1.5x break-even (fees kill profitability)
 """
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from core.engine import *
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.engine import (
+    get_klines, get_ticker, get_balance, get_free_margin,
+    get_position, closes, atr, ema, calc_atr_stop,
+    enter, close_position, safety_check, log_info, log_error, LEVERAGE,
+)
+from core.order_utils import (
+    OrderParams, choose_order_type, net_min_move, commission_cost,
+)
 
-FAST = int(os.getenv("EMA_FAST", "9"))
-SLOW = int(os.getenv("EMA_SLOW", "21"))
-ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.5"))
-ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "3.0"))
+EMA_FAST = int(os.getenv("EMA_FAST", "9"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
+ATR_MULT = float(os.getenv("ATR_MULT", "1.5"))
+RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.01"))
+EXPIRY_S = int(os.getenv("TREND_ORDER_EXPIRY_SEC", "600"))  # 10 min
 
-def run():
-    if not safety_check(): return
 
-    candles = get_klines(limit=200)
-    if not candles:
-        log_error("[TREND] No candle data")
+def run(symbol=None, category=None):
+    if not safety_check():
         return
 
-    c = closes(candles)
-    fast_ema = ema(c, FAST)
-    slow_ema = ema(c, SLOW)
-    fast_prev = ema(c[:-1], FAST)
-    slow_prev = ema(c[:-1], SLOW)
-    price = c[-1]
-    current_atr = atr(candles)
+    candles = get_klines(interval="60", limit=100, symbol=symbol, category=category)
+    if len(candles) < INEED := max(EMA_FAST, EMA_SLOW) + 5:
+        log_error(f"[trend_follow] not enough candles ({len(candles)} < {INEED})")
+        return
 
-    # Require actual cross (not just above/below)
-    cross_up   = fast_prev <= slow_prev and fast_ema > slow_ema
-    cross_down = fast_prev >= slow_prev and fast_ema < slow_ema
+    ticker = get_ticker(symbol, category)
+    price  = float(ticker.get("lastPrice", 0))
+    bid    = float(ticker.get("bid1Price", price))
+    ask    = float(ticker.get("ask1Price", price))
+    spread = (ask - bid) / price * 100 if price else 0
+    c      = closes(candles)
+    fast   = ema(c, EMA_FAST)
+    slow   = ema(c, EMA_SLOW)
+    prev_fast = ema(c[:-1], EMA_FAST)
+    prev_slow = ema(c[:-1], EMA_SLOW)
+    atr_val   = atr(candles)
 
-    log_info(f"[TREND] price={price:.2f} fast={fast_ema:.2f} slow={slow_ema:.2f} ATR={current_atr:.2f} cross_up={cross_up} cross_down={cross_down}")
+    cross_up   = prev_fast <= prev_slow and fast > slow
+    cross_down = prev_fast >= prev_slow and fast < slow
 
-    pos = get_position()
+    if not cross_up and not cross_down:
+        log_info(f"[trend_follow] no crossover — hold")
+        return
 
-    if cross_up and (pos is None or pos["side"] == "Sell"):
-        sl = round(price - ATR_MULT_SL * current_atr, 2)
-        tp = round(price + ATR_MULT_TP * current_atr, 2)
-        qty = calc_qty(stop_distance=price - sl)
-        set_leverage()
-        enter("Buy", qty, sl, tp, reason=f"EMA cross UP fast={fast_ema:.0f} slow={slow_ema:.0f}")
+    side          = "Buy" if cross_up else "Sell"
+    stop_dist     = ATR_MULT * atr_val
+    balance       = get_balance()
+    free_margin   = get_free_margin()
+    order_type, tif = choose_order_type(spread, urgency=False, strategy_hint="trend_follow")
+    maker         = order_type == "Limit"
+    min_move      = net_min_move(price, maker_entry=maker, maker_exit=maker)
 
-    elif cross_down and (pos is None or pos["side"] == "Buy"):
-        sl = round(price + ATR_MULT_SL * current_atr, 2)
-        tp = round(price - ATR_MULT_TP * current_atr, 2)
-        qty = calc_qty(stop_distance=sl - price)
-        set_leverage()
-        enter("Sell", qty, sl, tp, reason=f"EMA cross DOWN fast={fast_ema:.0f} slow={slow_ema:.0f}")
+    # Reject if stop too tight vs fees
+    if stop_dist < min_move * 1.5:
+        log_info(f"[trend_follow] stop={stop_dist:.4f} < 1.5x min_move={min_move:.4f} — skip")
+        return
 
-    else:
-        log_info(f"[TREND] No cross signal")
+    op = OrderParams.build(
+        side=side, price=price, spread_pct=spread,
+        stop_distance=stop_dist, balance=balance,
+        risk_pct=RISK_PCT, strategy_hint="trend_follow",
+        expiry_seconds=EXPIRY_S,
+    )
+    limit_price = round(bid if side == "Buy" else ask, 2)
+    stop_loss   = round(price - stop_dist if side == "Buy" else price + stop_dist, 2)
+    take_profit = round(price + 2 * stop_dist if side == "Buy" else price - 2 * stop_dist, 2)
+
+    log_info(
+        f"[trend_follow] {side} qty={op.qty} price={limit_price} "
+        f"sl={stop_loss} tp={take_profit} "
+        f"order={order_type}/{tif} expiry={EXPIRY_S}s "
+        f"commission={op.commission_usdt:.4f} USDT "
+        f"free_margin={free_margin:.2f}"
+    )
+
+    pos = get_position(symbol, category)
+    if pos:
+        if pos["side"] == side:
+            log_info(f"[trend_follow] already {side} — skip")
+            return
+        close_position(pos)
+
+    enter(
+        side=side, qty=op.qty,
+        stop_loss=stop_loss, take_profit=take_profit,
+        reason="trend_follow_ema_cross",
+        order_type=order_type, time_in_force=tif,
+        expiry_seconds=EXPIRY_S,
+        limit_price=limit_price,
+    )
+
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--symbol",   default=None)
+    p.add_argument("--category", default=None)
+    args = p.parse_args()
+    run(args.symbol, args.category)

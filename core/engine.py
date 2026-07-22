@@ -2,6 +2,13 @@
 Shared Trading Engine
 Used by all strategies as base layer.
 Provides: CLI wrapper, position sizing, ATR calc, logging, Telegram, error handling.
+
+Changes vs previous version:
+  - enter() accepts order_type / time_in_force / expiry_seconds
+  - calc_qty() delegates to order_utils.calc_qty_net (fee-aware)
+  - get_free_margin() helper: total_equity - position_margin_in_use
+  - Limit orders include --price arg for bybit-cli
+  - PostOnly / GTC / IOC / GoodTillDate fully wired through
 """
 import subprocess, json, os, time, statistics, datetime, argparse, sys
 from pathlib import Path
@@ -52,7 +59,7 @@ def get_klines(interval="60", limit=200, symbol=None, category=None):
                "--interval", interval,
                "--limit", str(limit))
     candles = data.get("result", {}).get("list", [])
-    return candles  # raw candles: [time, open, high, low, close, volume, turnover]
+    return candles  # raw: [time, open, high, low, close, volume, turnover]
 
 def closes(candles): return [float(c[4]) for c in candles]
 def highs(candles):  return [float(c[2]) for c in candles]
@@ -73,6 +80,22 @@ def get_balance():
     except:
         return 0.0
 
+def get_free_margin() -> float:
+    """Return free margin = totalEquity - totalInitialMargin.
+
+    This is the capital available to open new positions without
+    touching margin already allocated to open trades.
+    Falls back to get_balance() if field not available.
+    """
+    data = cli("account", "wallet-balance", "--accountType", "UNIFIED")
+    try:
+        info = data["result"]["list"][0]
+        equity  = float(info.get("totalEquity", 0))
+        im_used = float(info.get("totalInitialMargin", 0))
+        return max(equity - im_used, 0.0)
+    except:
+        return get_balance()
+
 def get_position(symbol=None, category=None):
     data = cli("position", "info",
                "--category", category or CATEGORY,
@@ -89,15 +112,14 @@ def get_funding_rate(symbol=None, category=None):
 
 # --- Snapshot (used by llm/agent_loop.py) ---
 def build_snapshot(symbol=None, category=None) -> dict:
-    """Collect market + account state and return as a JSON-serialisable dict.
-    Called via: python -m core.engine --snapshot [--json]
-    """
+    """Collect market + account state and return as a JSON-serialisable dict."""
     sym = symbol or SYMBOL
     cat = category or CATEGORY
     ts  = datetime.datetime.utcnow().isoformat() + "Z"
 
     ticker   = get_ticker(sym, cat)
     balance  = get_balance()
+    free_margin = get_free_margin()
     position = get_position(sym, cat)
     candles  = get_klines(interval="60", limit=50, symbol=sym, category=cat)
 
@@ -107,15 +129,15 @@ def build_snapshot(symbol=None, category=None) -> dict:
     funding    = float(ticker.get("fundingRate", 0))
     volume_24h = float(ticker.get("volume24h", 0))
     price_24h_pct = float(ticker.get("price24hPcnt", 0))
+    spread_pct = round((ask - bid) / price * 100, 4) if price else 0
 
     cl = closes(candles) if candles else []
-    current_rsi  = round(rsi(cl), 2)  if len(cl) >= 15 else None
-    current_atr  = round(atr(candles), 4) if len(candles) >= 15 else None
-    current_ema20 = round(ema(cl, 20), 4) if len(cl) >= 20 else None
-    current_ema50 = round(ema(cl, 50), 4) if len(cl) >= 50 else None
-    current_zscore = round(zscore(cl), 4) if len(cl) >= 50 else None
+    current_rsi   = round(rsi(cl), 2)     if len(cl) >= 15 else None
+    current_atr   = round(atr(candles), 4) if len(candles) >= 15 else None
+    current_ema20 = round(ema(cl, 20), 4)  if len(cl) >= 20 else None
+    current_ema50 = round(ema(cl, 50), 4)  if len(cl) >= 50 else None
+    current_zscore= round(zscore(cl), 4)   if len(cl) >= 50 else None
 
-    # Regime hint: above/below EMA50
     regime = "unknown"
     if current_ema50 and price:
         regime = "bullish" if price > current_ema50 else "bearish"
@@ -123,29 +145,30 @@ def build_snapshot(symbol=None, category=None) -> dict:
     pos_summary = None
     if position:
         pos_summary = {
-            "side":        position.get("side"),
-            "size":        float(position.get("size", 0)),
-            "entry_price": float(position.get("avgPrice", 0)),
+            "side":           position.get("side"),
+            "size":           float(position.get("size", 0)),
+            "entry_price":    float(position.get("avgPrice", 0)),
             "unrealised_pnl": float(position.get("unrealisedPnl", 0)),
-            "liq_price":   float(position.get("liqPrice", 0)),
-            "leverage":    float(position.get("leverage", LEVERAGE)),
+            "liq_price":      float(position.get("liqPrice", 0)),
+            "leverage":       float(position.get("leverage", LEVERAGE)),
         }
 
     snapshot = {
-        "timestamp":     ts,
-        "env":           BYBIT_ENV,
-        "symbol":        sym,
-        "category":      cat,
-        "price":         price,
-        "bid":           bid,
-        "ask":           ask,
-        "spread_pct":    round((ask - bid) / price * 100, 4) if price else 0,
-        "price_24h_pct": price_24h_pct,
-        "volume_24h":    volume_24h,
-        "funding_rate":  funding,
-        "balance_usdt":  round(balance, 4),
-        "max_risk_pct":  MAX_RISK_PCT,
-        "leverage":      LEVERAGE,
+        "timestamp":      ts,
+        "env":            BYBIT_ENV,
+        "symbol":         sym,
+        "category":       cat,
+        "price":          price,
+        "bid":            bid,
+        "ask":            ask,
+        "spread_pct":     spread_pct,
+        "price_24h_pct":  price_24h_pct,
+        "volume_24h":     volume_24h,
+        "funding_rate":   funding,
+        "balance_usdt":   round(balance, 4),
+        "free_margin":    round(free_margin, 4),
+        "max_risk_pct":   MAX_RISK_PCT,
+        "leverage":       LEVERAGE,
         "indicators": {
             "rsi_14":    current_rsi,
             "atr_14":    current_atr,
@@ -154,8 +177,8 @@ def build_snapshot(symbol=None, category=None) -> dict:
             "zscore_50": current_zscore,
             "regime":    regime,
         },
-        "open_position": pos_summary,
-        "kill_switch_active": False,  # can be overridden by safety_check()
+        "open_position":      pos_summary,
+        "kill_switch_active": False,
     }
     return snapshot
 
@@ -197,16 +220,29 @@ def zscore(prices, lookback=50):
 
 
 # --- Position sizing ---
-def calc_qty(stop_distance, risk_pct=None, balance=None):
-    """Fixed fractional sizing: qty = (balance * risk_pct) / stop_distance"""
+def calc_qty(stop_distance, risk_pct=None, balance=None, price=None):
+    """Fee-aware fixed-fractional sizing.
+
+    Delegates to order_utils.calc_qty_net so commission is always
+    deducted from the risk budget.  Backward-compatible: existing
+    callers that pass only stop_distance still work.
+    """
     if balance is None:
         balance = get_balance()
-    if balance <= 0 or stop_distance <= 0:
-        return float(os.getenv("QTY", "0.01"))
-    risk = balance * (risk_pct or MAX_RISK_PCT)
-    qty = risk / stop_distance
-    qty = max(round(qty, 3), 0.001)
-    return qty
+    if price is None or price <= 0:
+        # price unknown — fall back to legacy formula
+        if balance <= 0 or stop_distance <= 0:
+            return float(os.getenv("QTY", "0.01"))
+        risk = balance * (risk_pct or MAX_RISK_PCT)
+        return max(round(risk / stop_distance, 3), 0.001)
+    from core.order_utils import calc_qty_net
+    return calc_qty_net(
+        stop_distance=stop_distance,
+        balance=balance,
+        risk_pct=risk_pct or MAX_RISK_PCT,
+        price=price,
+        maker=True,  # assume limit by default
+    )
 
 def calc_atr_stop(candles, side, atr_mult=1.5):
     """ATR-based stop: entry ± ATR_mult * ATR"""
@@ -226,7 +262,7 @@ def set_leverage(leverage=None):
         "--buyLeverage", lev, "--sellLeverage", lev, "--yes")
 
 def close_position(pos=None):
-    """Close existing position before reversing"""
+    """Close existing position with Market IOC order."""
     if pos is None:
         pos = get_position()
     if pos is None:
@@ -236,13 +272,40 @@ def close_position(pos=None):
     result = cli("order", "create",
                  "--category", CATEGORY, "--symbol", SYMBOL,
                  "--side", close_side, "--orderType", "Market",
+                 "--timeInForce", "IOC",
                  "--qty", str(size), "--reduceOnly", "true",
                  "--cap-usd", CAP_USD, "--yes")
     log_trade("CLOSE", close_side, float(size), 0, 0, result)
     return result
 
-def enter(side, qty, stop_loss, take_profit=None, reason=""):
-    """Enter position with ATR stop. Closes opposite first."""
+
+def enter(
+    side: str,
+    qty: float,
+    stop_loss: float,
+    take_profit=None,
+    reason: str = "",
+    order_type: str = "Limit",
+    time_in_force: str = "PostOnly",
+    expiry_seconds: int | None = None,
+    limit_price: float | None = None,
+):
+    """Enter a position.
+
+    order_type     : 'Limit' (default, maker fee) or 'Market' (taker fee)
+    time_in_force  : 'PostOnly' | 'GTC' | 'IOC' | 'FOK' | 'GoodTillDate'
+    expiry_seconds : if set + Limit order, uses GoodTillDate with this TTL
+    limit_price    : required when order_type='Limit'; pass bid (Buy) or ask (Sell)
+                     from current ticker.  If None, falls back to Market.
+    """
+    from core.order_utils import order_expiry_args
+
+    # Guard: Limit requires a price
+    if order_type == "Limit" and limit_price is None:
+        log_info("[enter] limit_price not provided — falling back to Market/IOC")
+        order_type, time_in_force = "Market", "IOC"
+
+    # Close opposite position first
     pos = get_position()
     if pos and pos["side"] != side:
         log_info(f"Closing opposite {pos['side']} before entering {side}")
@@ -252,19 +315,30 @@ def enter(side, qty, stop_loss, take_profit=None, reason=""):
     args = [
         "order", "create",
         "--category", CATEGORY, "--symbol", SYMBOL,
-        "--side", side, "--orderType", "Market",
+        "--side", side, "--orderType", order_type,
         "--qty", str(qty),
         "--stopLoss", str(stop_loss),
         "--slTriggerBy", "LastPrice",
-        "--cap-usd", CAP_USD, "--yes"
+        "--cap-usd", CAP_USD, "--yes",
     ]
+
+    if order_type == "Limit" and limit_price is not None:
+        args += ["--price", str(round(limit_price, 2))]
+
+    # timeInForce + optional expiry
+    args += order_expiry_args(order_type, time_in_force, expiry_seconds)
+
     if take_profit:
         args += ["--takeProfit", str(take_profit), "--tpTriggerBy", "LastPrice"]
 
     result = cli(*args)
     price = closes(get_klines(limit=1))[-1] if result.get("retCode") == 0 else 0
     log_trade("ENTER", side, qty, price, stop_loss, result, reason)
-    alert(f"⏵ {side} {SYMBOL} qty={qty} sl={stop_loss} tp={take_profit or 'none'} | {reason}")
+    alert(
+        f"\u23f5 {order_type} {side} {SYMBOL} qty={qty} "
+        f"sl={stop_loss} tp={take_profit or 'none'} "
+        f"tif={time_in_force} | {reason}"
+    )
     return result
 
 
@@ -309,12 +383,11 @@ def alert(msg):
             "-d", f"text={text}"
         ], capture_output=True, timeout=5)
     except:
-        pass  # never crash trading loop on alert failure
+        pass
 
 
 # --- Safety checks ---
 def safety_check(max_daily_loss_pct=0.03):
-    """Returns False and activates kill-switch if daily loss > threshold"""
     try:
         data = cli("position", "closed-pnl", "--category", CATEGORY, "--limit", "50")
         trades = data.get("result", {}).get("list", [])
@@ -324,29 +397,27 @@ def safety_check(max_daily_loss_pct=0.03):
         loss_pct = abs(today_pnl) / balance if balance > 0 and today_pnl < 0 else 0
         if loss_pct > max_daily_loss_pct:
             log_error(f"Daily loss {loss_pct:.2%} > {max_daily_loss_pct:.2%}. Activating kill-switch.")
-            alert(f"⚠️ KILL-SWITCH: daily loss {loss_pct:.2%} exceeded threshold")
+            alert(f"\u26a0\ufe0f KILL-SWITCH: daily loss {loss_pct:.2%} exceeded threshold")
             cli("kill-switch")
             return False
         log_info(f"Safety OK | daily_pnl={today_pnl:.4f} USDT ({loss_pct:.2%}) | balance={balance:.2f}")
         return True
     except Exception as e:
         log_error(f"Safety check failed: {e}")
-        return True  # don't block on check failure
+        return True
 
 
-# --- CLI entrypoint (python -m core.engine) ---
+# --- CLI entrypoint ---
 def _cli_main():
     parser = argparse.ArgumentParser(description="Trading Engine CLI")
-    parser.add_argument("--snapshot", action="store_true",
-                        help="Print market + account snapshot as JSON and exit")
-    parser.add_argument("--json", action="store_true",
-                        help="Force JSON output (used with --snapshot)")
-    parser.add_argument("--action", type=str, help="Action to execute")
-    parser.add_argument("--symbol", type=str, default=SYMBOL)
-    parser.add_argument("--qty",    type=float, default=0.0)
+    parser.add_argument("--snapshot", action="store_true")
+    parser.add_argument("--json",     action="store_true")
+    parser.add_argument("--action",   type=str)
+    parser.add_argument("--symbol",   type=str, default=SYMBOL)
+    parser.add_argument("--qty",      type=float, default=0.0)
     parser.add_argument("--strategy", type=str, default="none")
-    parser.add_argument("--sl",    type=float, default=0.0)
-    parser.add_argument("--tp",    type=float, default=0.0)
+    parser.add_argument("--sl",       type=float, default=0.0)
+    parser.add_argument("--tp",       type=float, default=0.0)
     args = parser.parse_args()
 
     if args.snapshot:
@@ -359,7 +430,7 @@ def _cli_main():
             "open_long":      lambda: enter("Buy",  args.qty, args.sl, args.tp or None, args.strategy),
             "open_short":     lambda: enter("Sell", args.qty, args.sl, args.tp or None, args.strategy),
             "close_position": lambda: close_position(),
-            "reduce_size":    lambda: close_position(),  # partial reduce not yet implemented
+            "reduce_size":    lambda: close_position(),
         }
         fn = action_map.get(args.action)
         if fn:
