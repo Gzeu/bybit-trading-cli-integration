@@ -6,6 +6,9 @@ Telegram (primary):
   Agent -> user : trade alerts, tick summaries, status replies
   User -> agent : /commands polled each tick from a thread-safe queue
 
+Security: only chat IDs listed in TELEGRAM_ALLOWED_CHATS (or TELEGRAM_CHAT_ID
+as fallback) can issue commands. Unauthorized senders are silently ignored.
+
 Supported commands:
   /status         Reply with current balance, position, last action, regime
   /pnl            Reply with today's closed PnL
@@ -44,6 +47,21 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("comms")
+
+# ---------------------------------------------------------------------------
+# Telegram allowlist — only these chat IDs can issue commands
+# Set TELEGRAM_ALLOWED_CHATS as comma-separated IDs in .env
+# Falls back to TELEGRAM_CHAT_ID if TELEGRAM_ALLOWED_CHATS is not set
+# ---------------------------------------------------------------------------
+
+ALLOWED_CHAT_IDS: frozenset[str] = frozenset(
+    x.strip()
+    for x in os.getenv(
+        "TELEGRAM_ALLOWED_CHATS",
+        os.getenv("TELEGRAM_CHAT_ID", ""),
+    ).split(",")
+    if x.strip()
+)
 
 # ---------------------------------------------------------------------------
 # Command dataclass
@@ -134,9 +152,10 @@ class TelegramComms:
         self._last_action:  str = "none"
         self._last_symbol:  str = ""
         self._last_regime:  str = ""
+        self._last_send_ts: float = 0.0   # for send rate-limiting
         if self.enabled:
             self._start_poller()
-            log.info("[comms] Telegram comms enabled")
+            log.info(f"[comms] Telegram comms enabled | allowed_chats={ALLOWED_CHAT_IDS}")
         else:
             log.info("[comms] Telegram not configured — comms disabled")
 
@@ -159,10 +178,19 @@ class TelegramComms:
                         continue
                     chat_id  = msg.get("chat", {}).get("id")
                     username = msg.get("from", {}).get("username", "?")
+
+                    # --- SECURITY: reject unauthorized senders ---
+                    if ALLOWED_CHAT_IDS and str(chat_id) not in ALLOWED_CHAT_IDS:
+                        log.warning(
+                            f"[comms] ignored cmd from unauthorized chat_id={chat_id} "
+                            f"(@{username}): {text[:40]}"
+                        )
+                        continue
+
                     parts    = text.lstrip("/").split()
                     cmd_name = parts[0].lower().split("@")[0]  # handle /cmd@botname
                     cmd_args = parts[1:]
-                    log.info(f"[comms] /{cmd_name} from @{username}")
+                    log.info(f"[comms] /{cmd_name} from @{username} chat={chat_id}")
                     self._q.put(AgentCommand(
                         source="telegram", user=username,
                         cmd=cmd_name, args=cmd_args,
@@ -190,8 +218,13 @@ class TelegramComms:
         if not self.enabled:
             log.info(f"[comms:local] {text}")
             return
+        # Rate-limit: max 1 message per second (Telegram allows ~30/s, but be safe)
+        elapsed = time.monotonic() - self._last_send_ts
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
         cid = chat_id or self.chat_id
         _tg_send(self.token, cid, text)
+        self._last_send_ts = time.monotonic()
 
     def reply(self, cmd: AgentCommand, text: str) -> None:
         """Reply to a specific command (uses cmd.chat_id if available)."""
