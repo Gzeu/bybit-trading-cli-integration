@@ -6,43 +6,79 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-echo "==> bybit-trading-cli-integration setup"
+# ---- Colors ----------------------------------------------------------------
+RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[0;33m'
+BLU='\033[0;34m'; CYN='\033[0;36m'; WHT='\033[1;37m'; RST='\033[0m'
+BOLD='\033[1m'
+
+box()  { echo -e "${BLU}╭────────────────────────────────────────────────────────────╮${RST}"; }
+boxb() { echo -e "${BLU}╰────────────────────────────────────────────────────────────╯${RST}"; }
+step() { echo -e "\n${CYN}▶ ${BOLD}$*${RST}"; }
+ok()   { echo -e "  ${GRN}✔${RST}  $*"; }
+warn() { echo -e "  ${YLW}⚠${RST}  $*"; }
+fail() { echo -e "  ${RED}✘${RST}  $*"; }
+info() { echo -e "  ${WHT}   $*${RST}"; }
+
+clear
+box
+echo -e "${BLU}│${RST}   ${BOLD}${WHT}bybit-trading-cli-integration${RST}  —  Setup                     ${BLU}│${RST}"
+echo -e "${BLU}│${RST}   LLM Agent + Bybit CLI + 26 Strategies                    ${BLU}│${RST}"
+boxb
 echo
 
-# 1. Node CLI
-if ! command -v bybit-cli &>/dev/null; then
-  echo "[1/4] Installing bybit-official-trading-cli ..."
-  npm i -g bybit-official-trading-cli@latest
+# 1. bybit-cli
+step "[1/4] bybit-cli (npm)"
+if command -v bybit-cli &>/dev/null; then
+  ok "bybit-cli already installed"
 else
-  echo "[1/4] bybit-cli already installed: $(bybit-cli --version 2>/dev/null || echo ok)"
+  info "Installing bybit-official-trading-cli ..."
+  npm i -g bybit-official-trading-cli@latest && ok "bybit-cli installed" || fail "npm install failed"
 fi
 
 # 2. Python deps
-echo "[2/4] Installing Python requirements ..."
-python -m pip install -q -r requirements.txt
-echo "      openai: $(python -c 'import openai; print(openai.__version__)')"
+step "[2/4] Python dependencies"
+if python -c 'import openai' 2>/dev/null; then
+  VER=$(python -c 'import openai; print(openai.__version__)')
+  ok "openai ${VER} already installed"
+else
+  info "Running: pip install -r requirements.txt"
+  python -m pip install -q -r requirements.txt
+  VER=$(python -c 'import openai; print(openai.__version__)')
+  ok "openai ${VER} installed"
+fi
 
-# 3. Env file
-if [ ! -f .env ]; then
-  echo "[3/4] Creating .env from .env.example ..."
+# 3. .env
+step "[3/4] Environment file"
+if [ -f .env ]; then
+  ok ".env already exists"
+else
   cp .env.example .env
-  echo "      ⚠️  Edit .env and fill in BYBIT_API_KEY, BYBIT_API_SECRET, GROQ_API_KEY"
-else
-  echo "[3/4] .env already exists — skipping"
+  ok ".env created from .env.example"
+  warn "Edit .env and fill in: BYBIT_API_KEY, BYBIT_API_SECRET, GROQ_API_KEY"
+  info "  nano .env   or   code .env"
 fi
 
-# 4. LLM provider connectivity test
-echo "[4/4] Testing LLM provider connectivity ..."
+# Load .env
+export $(grep -v '^#' .env | grep -v '^$' | xargs) 2>/dev/null || true
+
+# 4. LLM connectivity
+step "[4/4] LLM provider test (${LLM_PROVIDER:-groq})"
 if python -m llm.providers test 2>&1 | grep -q '✅'; then
-  echo "      ✅ LLM provider OK"
+  ok "LLM provider ${LLM_PROVIDER:-groq} OK"
 else
-  echo "      ⚠️  LLM provider test failed — check GROQ_API_KEY in .env"
-  echo "      Run: bash llm/connect.sh list  (to see all providers)"
+  warn "LLM provider test failed — check your API key in .env"
+  info "  Run: bash llm/connect.sh list   (see all providers)"
+  info "  Run: bash llm/connect.sh test all"
 fi
 
+# Done
 echo
-echo "==> Setup complete. Next steps:"
-echo "    1. Edit .env with your keys"
-echo "    2. bash llm/connect.sh test         # verify LLM"
-echo "    3. python llm/agent_loop.py --dry-run --once  # first decision (no orders)"
-echo "    4. python llm/agent_loop.py --once  # live decision on testnet"
+echo -e "${GRN}╭────────────────────────────────────────────────────────────╮${RST}"
+echo -e "${GRN}│${RST}  ${BOLD}Setup complete! Next steps:${RST}                                ${GRN}│${RST}"
+echo -e "${GRN}│${RST}                                                            ${GRN}│${RST}"
+echo -e "${GRN}│${RST}  1. ${WHT}nano .env${RST}                    fill in your keys           ${GRN}│${RST}"
+echo -e "${GRN}│${RST}  2. ${WHT}bash scripts/health_check.sh${RST}  full system check           ${GRN}│${RST}"
+echo -e "${GRN}│${RST}  3. ${WHT}python llm/agent_loop.py --dry-run --once${RST}  first decision ${GRN}│${RST}"
+echo -e "${GRN}│${RST}  4. ${WHT}python llm/agent_loop.py --interval 900${RST}  live loop       ${GRN}│${RST}"
+echo -e "${GRN}╰────────────────────────────────────────────────────────────╯${RST}"
+echo
