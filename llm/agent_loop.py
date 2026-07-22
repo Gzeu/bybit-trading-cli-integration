@@ -1,17 +1,18 @@
-"""LLM Agent Loop v3
+"""LLM Agent Loop v4
 
 Workflow per tick:
-  1. warm_cache() at startup  → background prefetch before first tick
-  2. build_watchlist()        → instant (stale-while-revalidate, never blocks)
-  3. scan_opportunities()     → score each symbol (RSI, zscore, vol spike ...)
-  4. top N to LLM             → with regime, eligible strategies, indicators
-  5. validate + execute
+  1. comms.poll_commands()      → process Telegram commands (/pause /status etc)
+  2. collect_for_agent()        → parallel data collection (all symbols in one shot)
+  3. scan_opportunities()       → score using pre-collected indicators (no extra API)
+  4. top N to LLM               → with regime, eligible strategies, orderbook, pnl
+  5. validate + execute         → in-process enter()/close_position()
+  6. comms.send_tick_summary()  → Telegram summary after every decision
 
 Usage:
     python llm/agent_loop.py --once
     python llm/agent_loop.py --interval 900
     python llm/agent_loop.py --dry-run --once
-    python llm/agent_loop.py --symbols BTCUSDT,ETHUSDT  # manual override
+    python llm/agent_loop.py --symbols BTCUSDT,ETHUSDT
 """
 from __future__ import annotations
 
@@ -32,14 +33,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from llm.providers import chat_complete, parse_action
 from llm.watchlist import build_watchlist, warm_cache
+from llm.comms import TelegramComms, AgentCommand
 from core.engine import (
-    get_klines, get_ticker, get_balance, get_position,
     closes, highs, lows, volumes,
     rsi, atr, ema, zscore,
     enter, close_position, cli,
     SYMBOL, CATEGORY, LEVERAGE, CAP_USD,
     log_info, log_error,
 )
+from core.collector import collect_for_agent, AgentContext
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -99,7 +101,18 @@ SYSTEM_PROMPT_PATH = Path(__file__).parent / "SYSTEM_PROMPT.md"
 BRIEFING_PATH      = Path(__file__).parent.parent / "agent" / "AGENT_BRIEFING.md"
 
 # ---------------------------------------------------------------------------
-# Inline regime detection (no subprocess)
+# Global agent state (mutable by Telegram commands)
+# ---------------------------------------------------------------------------
+
+_state = {
+    "paused":    False,
+    "dry_run":   os.getenv("DRY_RUN", "false").lower() == "true",
+    "force_sym": None,  # symbol to force into next scan
+}
+
+
+# ---------------------------------------------------------------------------
+# Regime detection (uses pre-collected candles from ctx)
 # ---------------------------------------------------------------------------
 
 TREND_THRESH = float(os.getenv("TREND_THRESH",    "0.003"))
@@ -109,16 +122,10 @@ VOL_LOW      = float(os.getenv("VOL_THRESH_LOW",  "0.008"))
 
 def detect_regime_local(
     symbol: str,
-    category: str = "linear",
-    candles: list | None = None,
+    ctx: AgentContext,
 ) -> tuple[str, dict]:
-    """Detect market regime.
-
-    Pass *candles* when already available (e.g. from score_opportunity) to
-    avoid a redundant get_klines() call.  Fetches fresh data only if omitted.
-    """
-    if candles is None:
-        candles = get_klines(interval="60", limit=100, symbol=symbol, category=category)
+    """Detect regime using pre-collected candles from AgentContext (zero extra API calls)."""
+    candles = ctx.klines.get(symbol, [])
     if len(candles) < 20:
         return "unknown", {}
     c         = closes(candles)
@@ -147,8 +154,7 @@ def detect_regime_local(
     return regime, {
         "regime": regime, "mean_ret": round(mean_ret, 6),
         "volatility": round(vol, 6), "rsi": round(rsi_val, 2),
-        "atr_pct": round(atr_pct, 5), "vol_ratio": round(vol_ratio, 2),
-        "price": price,
+        "atr_pct": round(atr_pct, 5), "vol_ratio": round(vol_ratio, 2), "price": price,
     }
 
 
@@ -157,33 +163,31 @@ def eligible_strategies(regime: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Opportunity scanner
+# Opportunity scanner  (uses AgentContext — no extra API calls)
 # ---------------------------------------------------------------------------
 
-def score_opportunity(symbol: str, category: str = "linear") -> dict | None:
+def score_opportunity(symbol: str, ctx: AgentContext) -> dict | None:
+    """Score a symbol using pre-collected data from AgentContext."""
     try:
-        # Single get_klines call — reused by detect_regime_local via candles= param
-        candles   = get_klines(interval="60", limit=100, symbol=symbol, category=category)
-        if len(candles) < 20: return None
-        ticker    = get_ticker(symbol, category)
-        c         = closes(candles)
-        price     = c[-1]
-        rsi_val   = rsi(c)
-        atr_val   = atr(candles)
-        zs        = zscore(c) if len(c) >= 50 else 0.0
-        ema20     = ema(c, 20)
-        ema50     = ema(c, 50) if len(c) >= 50 else ema20
-        funding   = float(ticker.get("fundingRate", 0))
-        chg24h    = float(ticker.get("price24hPcnt", 0))
-        bid       = float(ticker.get("bid1Price", price))
-        ask       = float(ticker.get("ask1Price", price))
-        spread    = (ask - bid) / price * 100 if price else 0
-        vols      = volumes(candles)
-        vol_avg   = sum(vols[-20:]) / 20
+        candles = ctx.klines.get(symbol, [])
+        if len(candles) < 20:
+            return None
+        ticker  = ctx.ticker.get(symbol, {})
+        ind     = ctx.indicators.get(symbol, {})
+        price   = ctx.price(symbol)
+        rsi_val = ind.get("rsi") or rsi(closes(candles))
+        atr_val = ind.get("atr") or atr(candles)
+        zs      = ind.get("zscore") or 0.0
+        ema20   = ind.get("ema20") or price
+        ema50   = ind.get("ema50") or price
+        funding = float(ticker.get("fundingRate", 0))
+        chg24h  = float(ticker.get("price24hPcnt", 0))
+        spread  = ctx.spread_pct(symbol)
+        vols    = volumes(candles)
+        vol_avg = sum(vols[-20:]) / 20
         vol_spike = vols[-1] / vol_avg if vol_avg > 0 else 1
 
-        # Pass pre-fetched candles — no second API call per symbol
-        regime, rstats = detect_regime_local(symbol, category, candles=candles)
+        regime, rstats = detect_regime_local(symbol, ctx)
         strategies     = eligible_strategies(regime)
 
         score, signals = 0, []
@@ -202,53 +206,70 @@ def score_opportunity(symbol: str, category: str = "linear") -> dict | None:
             "atr": round(atr_val, 4), "funding": funding,
             "vol_spike": round(vol_spike, 2), "chg24h": round(chg24h, 4),
             "spread_pct": round(spread, 4), "ema20": round(ema20, 4), "ema50": round(ema50, 4),
+            "orderbook":  ctx.orderbook.get(symbol, {}),
         }
     except Exception as e:
         log.warning(f"[scan] {symbol}: {e}")
         return None
 
 
-def scan_opportunities(watchlist: list[str], top_n: int = 3,
-                       category: str = "linear") -> list[dict]:
+def scan_opportunities(
+    watchlist: list[str],
+    ctx: AgentContext,
+    top_n: int = 3,
+) -> list[dict]:
     results = []
     for sym in watchlist:
-        r = score_opportunity(sym, category)
+        r = score_opportunity(sym, ctx)
         if r:
             results.append(r)
-            log.info(f"[scan] {sym:14s} regime={r['regime']:8s} "
-                     f"score={r['score']:3d} {r['signals']}")
+            log.info(
+                f"[scan] {sym:14s} regime={r['regime']:8s} "
+                f"score={r['score']:3d} {r['signals']}"
+            )
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:top_n]
 
 
 # ---------------------------------------------------------------------------
-# LLM context
+# LLM context builder
 # ---------------------------------------------------------------------------
 
 def load_text(path: Path) -> str:
     return path.read_text() if path.exists() else ""
 
 
-def build_user_message(opportunities: list[dict], balance: float,
-                        open_position: dict | None, briefing: str) -> str:
+def build_user_message(
+    opportunities: list[dict],
+    ctx: AgentContext,
+    briefing: str,
+) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M UTC")
     strategy_menu: dict[str, list[str]] = {}
     for name, cfg in STRATEGY_REGISTRY.items():
         for r in cfg["regimes"]:
             strategy_menu.setdefault(r, []).append(name)
 
+    pos = ctx.open_positions[0] if ctx.open_positions else None
+
     parts: list[str] = []
     if briefing:
         parts.append(f"## Briefing\n{briefing[:600]}")
+
     parts.append(
         f"## Account ({ts})\n"
-        f"- balance_usdt: {round(balance, 2)}\n"
-        f"- open_position: {json.dumps(open_position) if open_position else 'none'}\n"
+        f"- balance_usdt: {round(ctx.balance, 2)}\n"
+        f"- free_margin: {round(ctx.free_margin, 2)}\n"
+        f"- today_pnl: {ctx.today_pnl:+.4f} USDT ({ctx.today_pnl_pct:+.4f}%)\n"
+        f"- open_position: {json.dumps(pos) if pos else 'none'}\n"
+        f"- open_orders: {len(ctx.open_orders)}\n"
         f"- env: {os.getenv('BYBIT_ENV', 'testnet')}"
     )
     parts.append("## Strategy Menu (regime → eligible)\n" + json.dumps(strategy_menu, indent=2))
     parts.append(f"## Top Opportunities ({len(opportunities)} of dynamic Bybit watchlist)")
+
     for i, o in enumerate(opportunities, 1):
+        ob = o.get("orderbook", {})
         parts.append(
             f"### #{i} {o['symbol']}  score={o['score']}/100\n"
             f"- regime={o['regime']}  rsi={o['rsi']}  zscore={o['zscore']}  atr={o['atr']}\n"
@@ -256,8 +277,11 @@ def build_user_message(opportunities: list[dict], balance: float,
             f"- eligible_strategies: {o['strategies']}\n"
             f"- ema20={o['ema20']} ema50={o['ema50']}  funding={o['funding']}  "
             f"vol_spike={o['vol_spike']}\n"
-            f"- chg24h={o['chg24h']*100:.2f}%  spread={o['spread_pct']}%  price={o['price']}"
+            f"- chg24h={o['chg24h']*100:.2f}%  spread={o['spread_pct']}%  price={o['price']}\n"
+            f"- orderbook: bid={ob.get('bid')} ask={ob.get('ask')} "
+            f"bid_size={ob.get('bid_size')} ask_size={ob.get('ask_size')}"
         )
+
     parts.append(
         '## Decision\nEmit ONE JSON:\n'
         '{"action":"<open_long|open_short|close_position|reduce_size|hold|wait>",\n'
@@ -288,46 +312,30 @@ def validate_action(action: dict) -> bool:
 
 
 def _reduce_position(symbol: str, category: str = "linear", reduce_pct: float = 0.5) -> dict:
-    """Close *reduce_pct* (default 50%) of current position size.
-
-    Uses reduceOnly=true so it never opens a new position accidentally.
-    Falls back to full close if position fetch fails.
-    """
-    pos = get_position(symbol, category)
+    pos = ctx_global.position_for(symbol) if ctx_global else None
     if not pos:
-        log.warning(f"[reduce] no open position for {symbol} — nothing to reduce")
+        from core.engine import get_position
+        pos = get_position(symbol, category)
+    if not pos:
         return {"retCode": 0, "retMsg": "no_position"}
-
     full_size  = float(pos.get("size", 0))
     reduce_qty = round(full_size * reduce_pct, 3)
     if reduce_qty <= 0:
-        log.warning(f"[reduce] computed qty={reduce_qty} for {symbol} — skipping")
         return {"retCode": 0, "retMsg": "qty_zero"}
-
     close_side = "Sell" if pos["side"] == "Buy" else "Buy"
-    log.info(f"[reduce] {symbol} {close_side} qty={reduce_qty} "
-             f"({reduce_pct*100:.0f}% of {full_size})")
-
-    result = cli(
+    return cli(
         "order", "create",
-        "--category", category,
-        "--symbol",   symbol,
-        "--side",     close_side,
-        "--orderType", "Market",
-        "--qty",      str(reduce_qty),
-        "--reduceOnly", "true",
-        "--cap-usd",  CAP_USD,
-        "--yes",
+        "--category", category, "--symbol", symbol,
+        "--side", close_side, "--orderType", "Market",
+        "--qty", str(reduce_qty), "--reduceOnly", "true",
+        "--cap-usd", CAP_USD, "--yes",
     )
-    return result
+
+
+ctx_global: AgentContext | None = None  # set each tick for reduce_position access
 
 
 def execute_action(action: dict, dry_run: bool = False) -> None:
-    """Execute validated LLM action by calling core.engine functions directly.
-
-    No subprocess(python -m core.engine) — enter()/close_position()/_reduce_position()
-    are imported at the top of this module and called in-process.
-    """
     act    = action["action"]
     symbol = str(action.get("symbol", os.getenv("DEFAULT_SYMBOL", SYMBOL)))
     cat    = os.getenv("CATEGORY", CATEGORY)
@@ -338,22 +346,19 @@ def execute_action(action: dict, dry_run: bool = False) -> None:
 
     if dry_run:
         log.info(f"[DRY-RUN] {json.dumps(action)}")
-        _notify_telegram(action, success=True, dry_run=True)
         return
 
     try:
         if act == "open_long":
             result = enter(
-                side="Buy",
-                qty=float(action.get("qty", 0)),
+                side="Buy", qty=float(action.get("qty", 0)),
                 stop_loss=float(action["sl"]),
                 take_profit=float(action["tp"]) if action.get("tp") else None,
                 reason=str(action.get("strategy", "")),
             )
         elif act == "open_short":
             result = enter(
-                side="Sell",
-                qty=float(action.get("qty", 0)),
+                side="Sell", qty=float(action.get("qty", 0)),
                 stop_loss=float(action["sl"]),
                 take_profit=float(action["tp"]) if action.get("tp") else None,
                 reason=str(action.get("strategy", "")),
@@ -361,81 +366,160 @@ def execute_action(action: dict, dry_run: bool = False) -> None:
         elif act == "close_position":
             result = close_position()
         elif act == "reduce_size":
-            # Partial close: 50% of current position (reduceOnly=true)
             result = _reduce_position(symbol, cat, reduce_pct=0.5)
         else:
-            log.error(f"Unhandled action in execute_action: {act}")
+            log.error(f"Unhandled action: {act}")
             return
 
         ok = result.get("retCode", -1) == 0 if result else False
-        log.info(f"Execute OK: {json.dumps(result)}") if ok else log.error(f"Execute failed: {json.dumps(result)}")
-        _notify_telegram(action, success=ok)
-
+        if ok:
+            log.info(f"Execute OK: {json.dumps(result)}")
+        else:
+            log.error(f"Execute failed: {json.dumps(result)}")
     except Exception as e:
         log.error(f"execute_action exception: {e}")
-        _notify_telegram(action, success=False)
 
 
-def _notify_telegram(action: dict, success: bool, dry_run: bool = False) -> None:
-    token   = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id: return
-    try:
-        prefix = "🧪 DRY" if dry_run else ("✅" if success else "❌")
-        text   = (
-            f"{prefix} {action.get('action','?').upper()} {action.get('side','')} "
-            f"{action.get('symbol','')} qty={action.get('qty','')}\n"
-            f"Strat: {action.get('strategy','')} | {action.get('reason','')}"
+# ---------------------------------------------------------------------------
+# Telegram command handler
+# ---------------------------------------------------------------------------
+
+def handle_command(
+    cmd: AgentCommand,
+    comms: TelegramComms,
+    ctx: AgentContext,
+    watchlist: list[str],
+) -> None:
+    c = cmd.cmd
+
+    if c == "status":
+        msg = comms.build_status_message(
+            ctx.balance, ctx.free_margin, ctx.today_pnl,
+            ctx.open_positions, ctx.open_orders,
         )
-        data = json.dumps({"chat_id": chat_id, "text": text}).encode()
-        req  = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data=data, headers={"Content-Type": "application/json"}
+        comms.reply(cmd, msg)
+
+    elif c == "pnl":
+        comms.reply(cmd, f"PnL today: `{ctx.today_pnl:+.4f}` USDT "
+                        f"({ctx.today_pnl_pct:+.4f}%)")
+
+    elif c == "pause":
+        _state["paused"] = True
+        comms.reply(cmd, "⏸ Trading *paused* — all decisions will be HOLD.")
+        log.info("[comms] Agent paused via Telegram")
+
+    elif c == "resume":
+        _state["paused"] = False
+        comms.reply(cmd, "▶️ Trading *resumed*.")
+        log.info("[comms] Agent resumed via Telegram")
+
+    elif c == "dry":
+        val = (cmd.args[0].lower() != "off") if cmd.args else True
+        _state["dry_run"] = val
+        comms.reply(cmd, f"🧪 Dry-run: *{'ON' if val else 'OFF'}*")
+
+    elif c == "watchlist":
+        comms.reply(cmd, f"Watchlist: `{watchlist}`")
+
+    elif c == "force":
+        sym = cmd.args[0].upper() if cmd.args else ""
+        if sym:
+            _state["force_sym"] = sym
+            comms.reply(cmd, f"Next tick will force scan `{sym}`")
+        else:
+            comms.reply(cmd, "Usage: /force SYMBOL")
+
+    elif c == "stop":
+        comms.reply(cmd, "🛑 Stopping agent after this tick...")
+        log.info("[comms] Stop requested via Telegram")
+        # signal via state; main loop checks this
+        _state["stop"] = True
+
+    elif c == "help":
+        comms.reply(cmd,
+            "🤖 *Commands*\n"
+            "`/status` — account snapshot\n"
+            "`/pnl` — today PnL\n"
+            "`/pause` / `/resume` — toggle trading\n"
+            "`/dry [on|off]` — toggle dry-run\n"
+            "`/watchlist` — current symbols\n"
+            "`/force SYMBOL` — force scan\n"
+            "`/stop` — graceful shutdown"
         )
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        log.warning(f"Telegram: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Main tick
 # ---------------------------------------------------------------------------
 
-def run_once(manual_watchlist: list[str] | None = None, dry_run: bool = False) -> dict:
-    t0  = time.time()
-    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S UTC")
+def run_once(
+    manual_watchlist: list[str] | None = None,
+    dry_run: bool = False,
+    comms: TelegramComms | None = None,
+) -> dict:
+    global ctx_global
+    t0 = time.time()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S UTC")
     log.info(f"=== Tick | {ts} ===")
 
-    # 1. Watchlist (instant — background prefetch already running)
+    # 0. Process Telegram commands
+    if comms:
+        for cmd in comms.poll_commands():
+            log.info(f"[comms] cmd=/{cmd.cmd} args={cmd.args} from={cmd.user}")
+            # Need ctx for /status — build minimal if not available yet
+            # We'll pass None ctx here; handle_command handles None gracefully
+            # after collection below. Commands that need ctx are deferred.
+            if cmd.cmd in {"pause", "resume", "dry", "stop", "force", "help"}:
+                handle_command(cmd, comms, AgentContext(), [])
+
+    # 1. Watchlist
     if manual_watchlist:
         watchlist = manual_watchlist
-        log.info(f"Manual watchlist: {watchlist}")
     else:
-        watchlist = build_watchlist()    # never blocks (stale-while-revalidate)
-        log.info(f"Dynamic watchlist ({len(watchlist)}): {watchlist}")
+        watchlist = build_watchlist()
+        if _state.get("force_sym"):
+            sym = _state.pop("force_sym")
+            if sym not in watchlist:
+                watchlist = [sym] + watchlist
+                log.info(f"[comms] Forced {sym} into watchlist")
+    log.info(f"Watchlist ({len(watchlist)}): {watchlist}")
 
-    # 2. Scan
+    # Pause gate
+    if _state["paused"]:
+        log.info("[state] Paused — skipping tick")
+        return {"action": "hold", "reason": "paused"}
+
+    # 2. Collect ALL data in parallel
+    ctx = collect_for_agent(watchlist)
+    ctx_global = ctx
+    log.info(f"[collector] {ctx.to_summary().splitlines()[0]} | fetch={ctx.fetch_ms}ms")
+    if ctx.errors:
+        log.warning(f"[collector] errors: {ctx.errors}")
+
+    # 2b. Now handle commands that need ctx (/status, /pnl, /watchlist)
+    if comms:
+        for cmd in comms.poll_commands():
+            handle_command(cmd, comms, ctx, watchlist)
+
+    # 3. Scan
     top_n = int(os.getenv("SCAN_TOP_N", "3"))
-    opps  = scan_opportunities(watchlist, top_n=top_n)
+    opps  = scan_opportunities(watchlist, ctx, top_n=top_n)
     if not opps:
         log.warning("No scoreable opportunities — holding")
         return {"action": "hold", "reason": "no_opportunities"}
-
-    # 3. Account
-    balance  = get_balance()
-    open_pos = get_position(opps[0]["symbol"])
-
-    # 4. Build context
-    briefing = load_text(BRIEFING_PATH)
-    system   = load_text(SYSTEM_PROMPT_PATH) or "Output only valid JSON."
-    user_msg = build_user_message(opps, balance, open_pos, briefing)
 
     best = opps[0]
     log.info(f"Best: {best['symbol']} score={best['score']} "
              f"regime={best['regime']} strats={best['strategies']}")
 
+    # 4. Build LLM context
+    briefing = load_text(BRIEFING_PATH)
+    system   = load_text(SYSTEM_PROMPT_PATH) or "Output only valid JSON."
+    user_msg = build_user_message(opps, ctx, briefing)
+
     # 5. LLM
-    log.info(f"LLM → provider={os.getenv('LLM_PROVIDER','groq')}")
+    effective_dry = dry_run or _state["dry_run"]
+    log.info(f"LLM → provider={os.getenv('LLM_PROVIDER','groq')} dry={effective_dry}")
     raw    = chat_complete(system=system, user=user_msg)
     action = parse_action(raw)
     if not action:
@@ -446,11 +530,27 @@ def run_once(manual_watchlist: list[str] | None = None, dry_run: bool = False) -
     # 6. Validate + execute
     if not validate_action(action):
         return {"action": "hold", "reason": "validation_blocked"}
-    execute_action(action, dry_run=dry_run)
+    execute_action(action, dry_run=effective_dry)
+
+    # 7. Tick summary to Telegram
+    if comms:
+        comms.send_tick_summary(
+            balance=ctx.balance,
+            free_margin=ctx.free_margin,
+            today_pnl=ctx.today_pnl,
+            action=action,
+            regime=best["regime"],
+            symbol=best["symbol"],
+            fetch_ms=ctx.fetch_ms,
+        )
 
     log.info(f"Tick done in {time.time()-t0:.2f}s")
     return action
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -460,43 +560,47 @@ def main() -> None:
     parser.add_argument("--symbols",  type=str, default="")
     args = parser.parse_args()
 
-    manual = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
+    manual  = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
+    dry_run = args.dry_run or _state["dry_run"]
+    comms   = TelegramComms()   # singleton; disabled gracefully if not configured
 
-    if args.dry_run:
+    if dry_run:
         log.info("DRY-RUN — no real orders")
 
-    # Warm cache BEFORE first tick so watchlist is ready instantly.
-    # Use threading.Event instead of sleep(3): yields as soon as the
-    # background prefetch finishes (or after 5s timeout as fallback).
+    # Warm watchlist cache
     if not manual:
-        log.info("Warming watchlist cache in background ...")
+        log.info("Warming watchlist cache ...")
         import llm.watchlist as _wl_mod
         _ready = threading.Event()
         _real_update = _wl_mod._cache.update
 
-        def _patched_update(symbols: list, detail: list) -> None:
+        def _patched_update(symbols, detail):
             _real_update(symbols, detail)
             _ready.set()
 
         _wl_mod._cache.update = _patched_update
         warm_cache()
-        _ready.wait(timeout=5)                 # 0–5s, not a fixed 3s
-        _wl_mod._cache.update = _real_update   # restore original method
-        log.info(f"Cache ready (waited {'' if _ready.is_set() else 'timeout '}after prefetch)")
+        _ready.wait(timeout=5)
+        _wl_mod._cache.update = _real_update
+        log.info("Cache ready")
 
     if args.once:
-        run_once(manual_watchlist=manual, dry_run=args.dry_run)
+        run_once(manual_watchlist=manual, dry_run=dry_run, comms=comms)
         return
 
-    log.info(f"Loop every {args.interval}s | watchlist TTL={os.getenv('WATCHLIST_CACHE_TTL_SEC','30')}s")
+    log.info(f"Loop every {args.interval}s")
     while True:
         try:
-            run_once(manual_watchlist=manual, dry_run=args.dry_run)
+            run_once(manual_watchlist=manual, dry_run=dry_run, comms=comms)
         except KeyboardInterrupt:
             log.info("Stopped.")
             break
         except Exception as e:
             log.error(f"Loop error: {e}")
+        if _state.get("stop"):
+            log.info("Stop requested — exiting.")
+            comms.send("🛑 Agent stopped.")
+            break
         log.info(f"Sleeping {args.interval}s")
         time.sleep(args.interval)
 
