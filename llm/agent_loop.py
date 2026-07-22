@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -104,8 +105,18 @@ VOL_HIGH     = float(os.getenv("VOL_THRESH_HIGH", "0.02"))
 VOL_LOW      = float(os.getenv("VOL_THRESH_LOW",  "0.008"))
 
 
-def detect_regime_local(symbol: str, category: str = "linear") -> tuple[str, dict]:
-    candles = get_klines(interval="60", limit=100, symbol=symbol, category=category)
+def detect_regime_local(
+    symbol: str,
+    category: str = "linear",
+    candles: list | None = None,
+) -> tuple[str, dict]:
+    """Detect market regime.
+
+    Pass *candles* when already available (e.g. from score_opportunity) to
+    avoid a redundant get_klines() call.  Fetches fresh data only if omitted.
+    """
+    if candles is None:
+        candles = get_klines(interval="60", limit=100, symbol=symbol, category=category)
     if len(candles) < 20:
         return "unknown", {}
     c         = closes(candles)
@@ -149,6 +160,7 @@ def eligible_strategies(regime: str) -> list[str]:
 
 def score_opportunity(symbol: str, category: str = "linear") -> dict | None:
     try:
+        # Single get_klines call — reused by detect_regime_local via candles= param
         candles   = get_klines(interval="60", limit=100, symbol=symbol, category=category)
         if len(candles) < 20: return None
         ticker    = get_ticker(symbol, category)
@@ -168,7 +180,8 @@ def score_opportunity(symbol: str, category: str = "linear") -> dict | None:
         vol_avg   = sum(vols[-20:]) / 20
         vol_spike = vols[-1] / vol_avg if vol_avg > 0 else 1
 
-        regime, rstats = detect_regime_local(symbol, category)
+        # Pass pre-fetched candles — no second API call per symbol
+        regime, rstats = detect_regime_local(symbol, category, candles=candles)
         strategies     = eligible_strategies(regime)
 
         score, signals = 0, []
@@ -387,12 +400,24 @@ def main() -> None:
     if args.dry_run:
         log.info("DRY-RUN — no real orders")
 
-    # Warm cache BEFORE first tick so watchlist is ready instantly
+    # Warm cache BEFORE first tick so watchlist is ready instantly.
+    # Use threading.Event instead of sleep(3): yields as soon as the
+    # background prefetch finishes (or after 5s timeout as fallback).
     if not manual:
         log.info("Warming watchlist cache in background ...")
+        import llm.watchlist as _wl_mod
+        _ready = threading.Event()
+        _real_update = _wl_mod._cache.update
+
+        def _patched_update(symbols: list, detail: list) -> None:
+            _real_update(symbols, detail)
+            _ready.set()
+
+        _wl_mod._cache.update = _patched_update
         warm_cache()
-        # Give the background thread a moment to finish before tick #1
-        time.sleep(min(3, args.interval))
+        _ready.wait(timeout=5)                 # 0–5s, not a fixed 3s
+        _wl_mod._cache.update = _real_update   # restore original method
+        log.info(f"Cache ready (waited {'' if _ready.is_set() else 'timeout '}after prefetch)")
 
     if args.once:
         run_once(manual_watchlist=manual, dry_run=args.dry_run)
