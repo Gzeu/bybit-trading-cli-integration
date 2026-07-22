@@ -41,7 +41,7 @@ def run(symbol=None, category=None):
     spread = (ask - bid) / price * 100 if price else 0
     ha     = heikin_ashi(candles)
     recent = ha[-HA_CONFIRM:]
-    bull   = all(c[3] > c[0] for c in recent)  # close > open
+    bull   = all(c[3] > c[0] for c in recent)
     bear   = all(c[3] < c[0] for c in recent)
     if not bull and not bear: log_info(f"[ha] no {HA_CONFIRM}-bar streak"); return
     side   = "Buy" if bull else "Sell"
@@ -56,4 +56,18 @@ def run(symbol=None, category=None):
         strategy_hint="heikin_ashi_trend", expiry_seconds=EXPIRY_S)
     lp = round(bid if side=="Buy" else ask, 2)
     sl = round(price - sl_dist if side=="Buy" else price + sl_dist, 2)
-    tp = round(pr
+    tp = round(price + 2*sl_dist if side=="Buy" else price - 2*sl_dist, 2)
+    log_info(f"[ha] {side} qty={op.qty} lp={lp} sl={sl} tp={tp} "
+             f"order={order_type}/{tif} comm={op.commission_usdt:.4f} free={free_mg:.2f}")
+    pos = get_position(symbol, category)
+    if pos:
+        if pos["side"] == side: return
+        close_position(pos)
+    enter(side=side, qty=op.qty, stop_loss=sl, take_profit=tp,
+          reason="ha_trend", order_type=order_type, time_in_force=tif,
+          expiry_seconds=EXPIRY_S, limit_price=lp)
+
+if __name__ == "__main__":
+    import argparse; p = argparse.ArgumentParser()
+    p.add_argument("--symbol", default=None); p.add_argument("--category", default=None)
+    a = p.parse_args(); run(a.symbol, a.category)
