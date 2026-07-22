@@ -1,10 +1,10 @@
-"""LLM Agent Loop — dynamic watchlist + multi-symbol scan + regime-filtered strategies.
+"""LLM Agent Loop v3
 
 Workflow per tick:
-  1. build_watchlist()         ← dynamic from Bybit (vol, spread, funding, OI)
-  2. scan_opportunities()      ← score each symbol (RSI, zscore, vol spike, ...)
-  3. top_n best symbols        ← sent to LLM with full context
-  4. LLM decides               ← symbol + strategy filtered by regime
+  1. warm_cache() at startup  → background prefetch before first tick
+  2. build_watchlist()        → instant (stale-while-revalidate, never blocks)
+  3. scan_opportunities()     → score each symbol (RSI, zscore, vol spike ...)
+  4. top N to LLM             → with regime, eligible strategies, indicators
   5. validate + execute
 
 Usage:
@@ -25,11 +25,12 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import statistics as _stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from llm.providers import chat_complete, parse_action
-from llm.watchlist import build_watchlist
+from llm.watchlist import build_watchlist, warm_cache
 from core.engine import (
     get_klines, get_ticker, get_balance, get_position,
     closes, highs, lows, volumes,
@@ -53,39 +54,39 @@ logging.basicConfig(
 log = logging.getLogger("llm_agent")
 
 # ---------------------------------------------------------------------------
-# Strategy registry  (26 strategies → regim)
+# Strategy registry
 # ---------------------------------------------------------------------------
 
 STRATEGY_REGISTRY: dict[str, dict[str, Any]] = {
-    "trend_follow":         {"regimes": ["bull", "bear"],              "type": "trend"},
-    "mean_reversion":       {"regimes": ["sideways"],                  "type": "mean_revert"},
-    "grid_trading":         {"regimes": ["sideways"],                  "type": "grid"},
-    "scalping":             {"regimes": ["bull", "bear", "sideways"],  "type": "scalp"},
-    "breakout":             {"regimes": ["volatile", "bull", "bear"],  "type": "breakout"},
+    "trend_follow":         {"regimes": ["bull", "bear"],             "type": "trend"},
+    "mean_reversion":       {"regimes": ["sideways"],                 "type": "mean_revert"},
+    "grid_trading":         {"regimes": ["sideways"],                 "type": "grid"},
+    "scalping":             {"regimes": ["bull", "bear", "sideways"], "type": "scalp"},
+    "breakout":             {"regimes": ["volatile", "bull", "bear"], "type": "breakout"},
     "funding_arb":          {"regimes": ["bull", "bear", "sideways", "volatile"], "type": "arb"},
-    "kalman_filter":        {"regimes": ["bull", "bear"],              "type": "trend"},
-    "bollinger_bands":      {"regimes": ["sideways"],                  "type": "mean_revert"},
-    "macd_signal":          {"regimes": ["bull", "bear"],              "type": "trend"},
-    "rsi_divergence":       {"regimes": ["sideways", "bull", "bear"],  "type": "reversal"},
-    "stochastic_rsi":       {"regimes": ["sideways"],                  "type": "oscillator"},
-    "adx_trend_filter":     {"regimes": ["bull", "bear"],              "type": "trend"},
-    "supertrend":           {"regimes": ["bull", "bear"],              "type": "trend"},
-    "ichimoku_cloud":       {"regimes": ["bull", "bear"],              "type": "trend"},
-    "heikin_ashi_trend":    {"regimes": ["bull", "bear"],              "type": "trend"},
-    "parabolic_sar":        {"regimes": ["bull", "bear"],              "type": "trend"},
-    "triple_ema":           {"regimes": ["bull", "bear"],              "type": "trend"},
-    "turtle_trading":       {"regimes": ["bull", "bear", "volatile"],  "type": "breakout"},
-    "vwap_reversion":       {"regimes": ["sideways"],                  "type": "mean_revert"},
-    "williams_r":           {"regimes": ["sideways", "bull", "bear"],  "type": "oscillator"},
-    "cci_reversal":         {"regimes": ["sideways"],                  "type": "reversal"},
-    "momentum_roc":         {"regimes": ["bull", "bear"],              "type": "momentum"},
+    "kalman_filter":        {"regimes": ["bull", "bear"],             "type": "trend"},
+    "bollinger_bands":      {"regimes": ["sideways"],                 "type": "mean_revert"},
+    "macd_signal":          {"regimes": ["bull", "bear"],             "type": "trend"},
+    "rsi_divergence":       {"regimes": ["sideways", "bull", "bear"], "type": "reversal"},
+    "stochastic_rsi":       {"regimes": ["sideways"],                 "type": "oscillator"},
+    "adx_trend_filter":     {"regimes": ["bull", "bear"],             "type": "trend"},
+    "supertrend":           {"regimes": ["bull", "bear"],             "type": "trend"},
+    "ichimoku_cloud":       {"regimes": ["bull", "bear"],             "type": "trend"},
+    "heikin_ashi_trend":    {"regimes": ["bull", "bear"],             "type": "trend"},
+    "parabolic_sar":        {"regimes": ["bull", "bear"],             "type": "trend"},
+    "triple_ema":           {"regimes": ["bull", "bear"],             "type": "trend"},
+    "turtle_trading":       {"regimes": ["bull", "bear", "volatile"], "type": "breakout"},
+    "vwap_reversion":       {"regimes": ["sideways"],                 "type": "mean_revert"},
+    "williams_r":           {"regimes": ["sideways", "bull", "bear"], "type": "oscillator"},
+    "cci_reversal":         {"regimes": ["sideways"],                 "type": "reversal"},
+    "momentum_roc":         {"regimes": ["bull", "bear"],             "type": "momentum"},
     "volatility_targeting": {"regimes": ["bull", "bear", "sideways", "volatile"], "type": "risk"},
-    "market_making":        {"regimes": ["sideways"],                  "type": "mm"},
-    "dca_accumulation":     {"regimes": ["sideways", "bull"],          "type": "dca"},
-    "multi_timeframe":      {"regimes": ["bull", "bear"],              "type": "confluence"},
-    "pairs_trading":        {"regimes": ["sideways", "volatile"],      "type": "stat_arb"},
-    "open_interest_spike":  {"regimes": ["volatile", "bull", "bear"],  "type": "flow"},
-    "liquidation_hunt":     {"regimes": ["volatile"],                  "type": "flow"},
+    "market_making":        {"regimes": ["sideways"],                 "type": "mm"},
+    "dca_accumulation":     {"regimes": ["sideways", "bull"],         "type": "dca"},
+    "multi_timeframe":      {"regimes": ["bull", "bear"],             "type": "confluence"},
+    "pairs_trading":        {"regimes": ["sideways", "volatile"],     "type": "stat_arb"},
+    "open_interest_spike":  {"regimes": ["volatile", "bull", "bear"], "type": "flow"},
+    "liquidation_hunt":     {"regimes": ["volatile"],                 "type": "flow"},
 }
 
 ALLOWED_STRATEGIES = set(STRATEGY_REGISTRY.keys())
@@ -97,7 +98,6 @@ BRIEFING_PATH      = Path(__file__).parent.parent / "agent" / "AGENT_BRIEFING.md
 # ---------------------------------------------------------------------------
 # Inline regime detection (no subprocess)
 # ---------------------------------------------------------------------------
-import statistics as _stats
 
 TREND_THRESH = float(os.getenv("TREND_THRESH",    "0.003"))
 VOL_HIGH     = float(os.getenv("VOL_THRESH_HIGH", "0.02"))
@@ -144,14 +144,13 @@ def eligible_strategies(regime: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Multi-symbol opportunity scanner
+# Opportunity scanner
 # ---------------------------------------------------------------------------
 
 def score_opportunity(symbol: str, category: str = "linear") -> dict | None:
     try:
-        candles = get_klines(interval="60", limit=100, symbol=symbol, category=category)
-        if len(candles) < 20:
-            return None
+        candles   = get_klines(interval="60", limit=100, symbol=symbol, category=category)
+        if len(candles) < 20: return None
         ticker    = get_ticker(symbol, category)
         c         = closes(candles)
         price     = c[-1]
@@ -194,19 +193,21 @@ def score_opportunity(symbol: str, category: str = "linear") -> dict | None:
         return None
 
 
-def scan_opportunities(watchlist: list[str], top_n: int = 3, category: str = "linear") -> list[dict]:
+def scan_opportunities(watchlist: list[str], top_n: int = 3,
+                       category: str = "linear") -> list[dict]:
     results = []
     for sym in watchlist:
         r = score_opportunity(sym, category)
         if r:
             results.append(r)
-            log.info(f"[scan] {sym:14s} regime={r['regime']:8s} score={r['score']:3d} {r['signals']}")
+            log.info(f"[scan] {sym:14s} regime={r['regime']:8s} "
+                     f"score={r['score']:3d} {r['signals']}")
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:top_n]
 
 
 # ---------------------------------------------------------------------------
-# LLM context builder
+# LLM context
 # ---------------------------------------------------------------------------
 
 def load_text(path: Path) -> str:
@@ -216,41 +217,45 @@ def load_text(path: Path) -> str:
 def build_user_message(opportunities: list[dict], balance: float,
                         open_position: dict | None, briefing: str) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M UTC")
-    strategy_menu = {}
+    strategy_menu: dict[str, list[str]] = {}
     for name, cfg in STRATEGY_REGISTRY.items():
         for r in cfg["regimes"]:
             strategy_menu.setdefault(r, []).append(name)
 
-    parts = []
+    parts: list[str] = []
     if briefing:
-        parts.append(f"## Agent Briefing\n{briefing[:600]}")
-    parts.append(f"""## Account ({ts})
-- balance_usdt: {round(balance, 2)}
-- open_position: {json.dumps(open_position) if open_position else 'none'}
-- env: {os.getenv('BYBIT_ENV', 'testnet')}
-""")
-    parts.append("## Strategy Menu (regime → eligible strategies)\n" + json.dumps(strategy_menu, indent=2))
-    parts.append(f"## Top Opportunities ({len(opportunities)} symbols scanned from dynamic Bybit watchlist)")
+        parts.append(f"## Briefing\n{briefing[:600]}")
+    parts.append(
+        f"## Account ({ts})\n"
+        f"- balance_usdt: {round(balance, 2)}\n"
+        f"- open_position: {json.dumps(open_position) if open_position else 'none'}\n"
+        f"- env: {os.getenv('BYBIT_ENV', 'testnet')}"
+    )
+    parts.append("## Strategy Menu (regime → eligible)\n" + json.dumps(strategy_menu, indent=2))
+    parts.append(f"## Top Opportunities ({len(opportunities)} of dynamic Bybit watchlist)")
     for i, o in enumerate(opportunities, 1):
-        parts.append(f"""### #{i} {o['symbol']}  score={o['score']}/100
-- regime={o['regime']}  rsi={o['rsi']}  zscore={o['zscore']}  atr={o['atr']}
-- signals: {o['signals']}
-- eligible_strategies: {o['strategies']}
-- ema20={o['ema20']} ema50={o['ema50']}  funding={o['funding']}  vol_spike={o['vol_spike']}
-- chg24h={o['chg24h']*100:.2f}%  spread={o['spread_pct']}%  price={o['price']}
-""")
-    parts.append("""## Decision
-Emit ONE JSON:
-{"action":"<open_long|open_short|close_position|reduce_size|hold|wait>",
- "strategy":"<from eligible_strategies>","side":"<buy|sell|none>",
- "symbol":"<symbol>","qty":<float>,"sl":<float>,"tp":<float>,
- "reason":"<max 15 words>"}
-Rules: sl mandatory for open_long/open_short. If no edge, emit hold.""")
+        parts.append(
+            f"### #{i} {o['symbol']}  score={o['score']}/100\n"
+            f"- regime={o['regime']}  rsi={o['rsi']}  zscore={o['zscore']}  atr={o['atr']}\n"
+            f"- signals: {o['signals']}\n"
+            f"- eligible_strategies: {o['strategies']}\n"
+            f"- ema20={o['ema20']} ema50={o['ema50']}  funding={o['funding']}  "
+            f"vol_spike={o['vol_spike']}\n"
+            f"- chg24h={o['chg24h']*100:.2f}%  spread={o['spread_pct']}%  price={o['price']}"
+        )
+    parts.append(
+        '## Decision\nEmit ONE JSON:\n'
+        '{"action":"<open_long|open_short|close_position|reduce_size|hold|wait>",\n'
+        ' "strategy":"<from eligible_strategies>","side":"<buy|sell|none>",\n'
+        ' "symbol":"<symbol>","qty":<float>,"sl":<float>,"tp":<float>,\n'
+        ' "reason":"<max 15 words>"}\n'
+        'Rules: sl mandatory for open_long/open_short. No edge → hold.'
+    )
     return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Validation + execution
+# Validate + execute
 # ---------------------------------------------------------------------------
 
 def validate_action(action: dict) -> bool:
@@ -262,7 +267,7 @@ def validate_action(action: dict) -> bool:
         log.warning(f"Unknown strategy '{strat}' — resetting to none")
         action["strategy"] = "none"
     if action["action"] in {"open_long", "open_short"} and not action.get("sl"):
-        log.error("BLOCKED: missing sl")
+        log.error("BLOCKED: open order missing sl")
         return False
     return True
 
@@ -278,9 +283,9 @@ def execute_action(action: dict, dry_run: bool = False) -> None:
         return
     cmd = [
         "python", "-m", "core.engine",
-        "--action", action["action"],
-        "--symbol", str(action.get("symbol", os.getenv("DEFAULT_SYMBOL", "BTCUSDT"))),
-        "--qty",    str(action.get("qty", 0)),
+        "--action",   action["action"],
+        "--symbol",   str(action.get("symbol", os.getenv("DEFAULT_SYMBOL", "BTCUSDT"))),
+        "--qty",      str(action.get("qty", 0)),
         "--strategy", str(action.get("strategy", "none")),
     ]
     if action.get("sl"): cmd += ["--sl", str(action["sl"])]
@@ -296,8 +301,7 @@ def execute_action(action: dict, dry_run: bool = False) -> None:
 def _notify_telegram(action: dict, success: bool, dry_run: bool = False) -> None:
     token   = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return
+    if not token or not chat_id: return
     try:
         prefix = "🧪 DRY" if dry_run else ("✅" if success else "❌")
         text   = (
@@ -319,61 +323,54 @@ def _notify_telegram(action: dict, success: bool, dry_run: bool = False) -> None
 # Main tick
 # ---------------------------------------------------------------------------
 
-WATCHLIST_REFRESH_TICKS = int(os.getenv("WATCHLIST_REFRESH_TICKS", "4"))  # refresh every 4 ticks
-_tick_count = 0
-
-
 def run_once(manual_watchlist: list[str] | None = None, dry_run: bool = False) -> dict:
-    global _tick_count
-    _tick_count += 1
+    t0  = time.time()
+    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S UTC")
+    log.info(f"=== Tick | {ts} ===")
 
-    log.info(f"=== Tick #{_tick_count} | {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M UTC')} ===")
-
-    # 1. Watchlist: dynamic from Bybit OR manual override
+    # 1. Watchlist (instant — background prefetch already running)
     if manual_watchlist:
         watchlist = manual_watchlist
-        log.info(f"Using manual watchlist: {watchlist}")
+        log.info(f"Manual watchlist: {watchlist}")
     else:
-        force_refresh = (_tick_count % WATCHLIST_REFRESH_TICKS == 1)
-        watchlist = build_watchlist(force=force_refresh)
-        log.info(f"Dynamic watchlist ({len(watchlist)} symbols): {watchlist}")
+        watchlist = build_watchlist()    # never blocks (stale-while-revalidate)
+        log.info(f"Dynamic watchlist ({len(watchlist)}): {watchlist}")
 
-    # 2. Scan opportunities
+    # 2. Scan
     top_n = int(os.getenv("SCAN_TOP_N", "3"))
-    opportunities = scan_opportunities(watchlist, top_n=top_n)
-    if not opportunities:
+    opps  = scan_opportunities(watchlist, top_n=top_n)
+    if not opps:
         log.warning("No scoreable opportunities — holding")
         return {"action": "hold", "reason": "no_opportunities"}
 
-    # 3. Account state
-    balance       = get_balance()
-    open_position = get_position(opportunities[0]["symbol"])
+    # 3. Account
+    balance  = get_balance()
+    open_pos = get_position(opps[0]["symbol"])
 
-    # 4. Build LLM context
+    # 4. Build context
     briefing = load_text(BRIEFING_PATH)
-    system   = load_text(SYSTEM_PROMPT_PATH) or "You are a trading decision agent. Output only valid JSON."
-    user_msg = build_user_message(opportunities, balance, open_position, briefing)
+    system   = load_text(SYSTEM_PROMPT_PATH) or "Output only valid JSON."
+    user_msg = build_user_message(opps, balance, open_pos, briefing)
 
-    best = opportunities[0]
-    log.info(f"Best: {best['symbol']} score={best['score']} regime={best['regime']} strategies={best['strategies']}")
+    best = opps[0]
+    log.info(f"Best: {best['symbol']} score={best['score']} "
+             f"regime={best['regime']} strats={best['strategies']}")
 
-    # 5. LLM call
-    log.info(f"LLM call — provider={os.getenv('LLM_PROVIDER','groq')} model={os.getenv('LLM_MODEL','?')}")
-    raw = chat_complete(system=system, user=user_msg)
-
-    # 6. Parse
+    # 5. LLM
+    log.info(f"LLM → provider={os.getenv('LLM_PROVIDER','groq')}")
+    raw    = chat_complete(system=system, user=user_msg)
     action = parse_action(raw)
     if not action:
-        log.error("LLM parse error — holding")
+        log.error("Parse error — holding")
         return {"action": "hold", "reason": "parse_error"}
     log.info(f"LLM → {json.dumps(action)}")
 
-    # 7. Validate
+    # 6. Validate + execute
     if not validate_action(action):
         return {"action": "hold", "reason": "validation_blocked"}
-
-    # 8. Execute
     execute_action(action, dry_run=dry_run)
+
+    log.info(f"Tick done in {time.time()-t0:.2f}s")
     return action
 
 
@@ -382,19 +379,26 @@ def main() -> None:
     parser.add_argument("--once",     action="store_true")
     parser.add_argument("--interval", type=int, default=900)
     parser.add_argument("--dry-run",  action="store_true")
-    parser.add_argument("--symbols",  type=str, default="",
-                        help="Comma-separated manual watchlist override")
+    parser.add_argument("--symbols",  type=str, default="")
     args = parser.parse_args()
 
     manual = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
+
     if args.dry_run:
         log.info("DRY-RUN — no real orders")
+
+    # Warm cache BEFORE first tick so watchlist is ready instantly
+    if not manual:
+        log.info("Warming watchlist cache in background ...")
+        warm_cache()
+        # Give the background thread a moment to finish before tick #1
+        time.sleep(min(3, args.interval))
 
     if args.once:
         run_once(manual_watchlist=manual, dry_run=args.dry_run)
         return
 
-    log.info(f"Loop every {args.interval}s (watchlist refresh every {WATCHLIST_REFRESH_TICKS} ticks)")
+    log.info(f"Loop every {args.interval}s | watchlist TTL={os.getenv('WATCHLIST_CACHE_TTL_SEC','30')}s")
     while True:
         try:
             run_once(manual_watchlist=manual, dry_run=args.dry_run)
