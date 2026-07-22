@@ -1,6 +1,34 @@
 # bybit-trading-cli-integration
 
-> Advanced AI agent integration layer for [bybit-official-trading-cli](https://github.com/bybit-exchange/trading-cli) — V5 API, 26 strategies, free LLM decision layer, safety guards, Telegram alerts.
+> Advanced AI agent integration layer for [bybit-official-trading-cli](https://github.com/bybit-exchange/trading-cli) — V5 API, 29 strategies, free LLM decision layer, safety guards, Telegram alerts.
+
+## Prerequisites
+
+### 1. bybit-cli (required external binary)
+
+`core/engine.py` calls the Bybit V5 API through `bybit-cli`, an **npm binary** that handles authentication, request signing, and testnet/mainnet switching. It must be installed separately before running anything:
+
+```bash
+# Requires Node.js 20+
+node --version   # must be >= 20
+npm install -g @bybit-exchange/trading-cli
+bybit-cli --version   # verify install
+```
+
+If you don't have Node 20:
+```bash
+# macOS
+brew install node@20
+# Ubuntu/Debian
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+```
+
+### 2. Python 3.11+
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Quick start
 
@@ -36,7 +64,9 @@ python llm/agent_loop.py --interval 900
 ## Architecture
 
 ```
-Market Snapshot  ←→  core/engine.py --snapshot
+Market Snapshot  ←→  bybit-cli (subprocess)
+       ↓
+core/engine.py   — indicators, sizing, order execution
        ↓
 llm/agent_loop.py
        ↓   system prompt + briefing + snapshot
@@ -44,7 +74,7 @@ LLM free  (Groq / OpenRouter / Gemini / Ollama)
        ↓   JSON { action, strategy, side, qty, sl, tp, reason }
 Whitelist validation
        ↓
-core/engine.py --action ...    (real execution via bybit-cli)
+execute_action() → enter() / close_position()  (direct Python call)
        ↓
 Telegram notify
 ```
@@ -74,7 +104,7 @@ LLM_MODEL=llama-3.1-8b-instant
 LLM_FALLBACK_CHAIN=groq,openrouter,gemini   # auto-fallback order
 ```
 
-## Strategies (26)
+## Strategies (29)
 
 | File | Strategy | Type | Market |
 |---|---|---|---|
@@ -85,7 +115,6 @@ LLM_FALLBACK_CHAIN=groq,openrouter,gemini   # auto-fallback order
 | `breakout.py` | ATR volatility breakout | Breakout | Futures |
 | `funding_arb.py` | Funding rate arbitrage | Arb | Futures |
 | `kalman_filter.py` | Kalman filter trend | Quant | Futures |
-| `regime_detection.py` | HMM market regime | Quant | Any |
 | `bollinger_bands.py` | Bollinger band reversion | Mean-rev | Any |
 | `macd_signal.py` | MACD histogram signal | Trend | Any |
 | `rsi_divergence.py` | RSI divergence | Reversal | Any |
@@ -135,11 +164,12 @@ Full agent context: see [`SKILL.md`](SKILL.md) and [`agent/AGENT_BRIEFING.md`](a
 │   └── engine.py          # shared engine: CLI wrapper, indicators, sizing, logging
 ├── llm/
 │   ├── providers.py       # multi-provider client (Groq/OpenRouter/Gemini/Ollama/...)
-│   ├── agent_loop.py      # main loop: snapshot → LLM → validate → engine
+│   ├── agent_loop.py      # main loop: watchlist → scan → LLM → validate → engine
+│   ├── watchlist.py       # dynamic Bybit watchlist builder (stale-while-revalidate)
 │   ├── SYSTEM_PROMPT.md   # strict JSON-only prompt with whitelist
 │   ├── connect.sh         # provider test helper
 │   └── README.md
-├── strategies/            # 26+ strategy files
+├── strategies/            # 29 strategy files
 ├── agent/
 │   ├── AGENT_BRIEFING.md
 │   ├── DECISION_TREE.md

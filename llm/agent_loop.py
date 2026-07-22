@@ -36,6 +36,8 @@ from core.engine import (
     get_klines, get_ticker, get_balance, get_position,
     closes, highs, lows, volumes,
     rsi, atr, ema, zscore,
+    enter, close_position, cli,
+    SYMBOL, CATEGORY, LEVERAGE, CAP_USD,
     log_info, log_error,
 )
 
@@ -285,30 +287,93 @@ def validate_action(action: dict) -> bool:
     return True
 
 
+def _reduce_position(symbol: str, category: str = "linear", reduce_pct: float = 0.5) -> dict:
+    """Close *reduce_pct* (default 50%) of current position size.
+
+    Uses reduceOnly=true so it never opens a new position accidentally.
+    Falls back to full close if position fetch fails.
+    """
+    pos = get_position(symbol, category)
+    if not pos:
+        log.warning(f"[reduce] no open position for {symbol} — nothing to reduce")
+        return {"retCode": 0, "retMsg": "no_position"}
+
+    full_size  = float(pos.get("size", 0))
+    reduce_qty = round(full_size * reduce_pct, 3)
+    if reduce_qty <= 0:
+        log.warning(f"[reduce] computed qty={reduce_qty} for {symbol} — skipping")
+        return {"retCode": 0, "retMsg": "qty_zero"}
+
+    close_side = "Sell" if pos["side"] == "Buy" else "Buy"
+    log.info(f"[reduce] {symbol} {close_side} qty={reduce_qty} "
+             f"({reduce_pct*100:.0f}% of {full_size})")
+
+    result = cli(
+        "order", "create",
+        "--category", category,
+        "--symbol",   symbol,
+        "--side",     close_side,
+        "--orderType", "Market",
+        "--qty",      str(reduce_qty),
+        "--reduceOnly", "true",
+        "--cap-usd",  CAP_USD,
+        "--yes",
+    )
+    return result
+
+
 def execute_action(action: dict, dry_run: bool = False) -> None:
-    import subprocess
-    if action["action"] in {"hold", "wait"}:
-        log.info(f"Decision: {action['action']} — {action.get('reason', '')}")
+    """Execute validated LLM action by calling core.engine functions directly.
+
+    No subprocess(python -m core.engine) — enter()/close_position()/_reduce_position()
+    are imported at the top of this module and called in-process.
+    """
+    act    = action["action"]
+    symbol = str(action.get("symbol", os.getenv("DEFAULT_SYMBOL", SYMBOL)))
+    cat    = os.getenv("CATEGORY", CATEGORY)
+
+    if act in {"hold", "wait"}:
+        log.info(f"Decision: {act} — {action.get('reason', '')}")
         return
+
     if dry_run:
         log.info(f"[DRY-RUN] {json.dumps(action)}")
         _notify_telegram(action, success=True, dry_run=True)
         return
-    cmd = [
-        "python", "-m", "core.engine",
-        "--action",   action["action"],
-        "--symbol",   str(action.get("symbol", os.getenv("DEFAULT_SYMBOL", "BTCUSDT"))),
-        "--qty",      str(action.get("qty", 0)),
-        "--strategy", str(action.get("strategy", "none")),
-    ]
-    if action.get("sl"): cmd += ["--sl", str(action["sl"])]
-    if action.get("tp"): cmd += ["--tp", str(action["tp"])]
-    log.info(f"Executing: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True,
-                            cwd=str(Path(__file__).parent.parent))
-    ok = result.returncode == 0
-    log.info(result.stdout.strip()) if ok else log.error(result.stderr.strip())
-    _notify_telegram(action, success=ok)
+
+    try:
+        if act == "open_long":
+            result = enter(
+                side="Buy",
+                qty=float(action.get("qty", 0)),
+                stop_loss=float(action["sl"]),
+                take_profit=float(action["tp"]) if action.get("tp") else None,
+                reason=str(action.get("strategy", "")),
+            )
+        elif act == "open_short":
+            result = enter(
+                side="Sell",
+                qty=float(action.get("qty", 0)),
+                stop_loss=float(action["sl"]),
+                take_profit=float(action["tp"]) if action.get("tp") else None,
+                reason=str(action.get("strategy", "")),
+            )
+        elif act == "close_position":
+            result = close_position()
+        elif act == "reduce_size":
+            # Partial close: 50% of current position (reduceOnly=true)
+            result = _reduce_position(symbol, cat, reduce_pct=0.5)
+        else:
+            log.error(f"Unhandled action in execute_action: {act}")
+            return
+
+        ok = result.get("retCode", -1) == 0 if result else False
+        log.info(f"Execute OK: {json.dumps(result)}") if ok else log.error(f"Execute failed: {json.dumps(result)}")
+        _notify_telegram(action, success=ok)
+
+    except Exception as e:
+        log.error(f"execute_action exception: {e}")
+        _notify_telegram(action, success=False)
 
 
 def _notify_telegram(action: dict, success: bool, dry_run: bool = False) -> None:

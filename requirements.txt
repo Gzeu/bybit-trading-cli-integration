@@ -1,14 +1,27 @@
-# Core LLM agent dep
+# ============================================================
+# Python dependencies
+# pip install -r requirements.txt
+# ============================================================
+
+# --- External binary dependency (NOT pip) -------------------
+# bybit-cli is an npm binary used by core/engine.py for all
+# Bybit V5 API calls (market data, orders, positions).
+# Install once before running anything:
+#
+#   npm install -g @bybit-exchange/trading-cli
+#   bybit-cli --version
+#
+# Requires Node.js >= 20. See README Prerequisites section.
+# ------------------------------------------------------------
+
+# Core LLM agent
 openai>=1.30.0
 
-# Used by core/engine.py strategies (standard library covers most, but explicit for deploys)
-# No extra deps needed beyond stdlib + openai for the trading engine itself
+# .env loading (used by all modules via os.getenv)
+python-dotenv>=1.0.0
 
 # Optional: faster JSON parsing
 # orjson>=3.9.0
-
-# Optional: dotenv loading
-python-dotenv>=1.0.0
 
 # Optional: Telegram via httpx instead of curl
 # httpx>=0.27.0
