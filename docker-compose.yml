@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  commander:
+    build: .
+    container_name: bybit-commander
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=UTC
+    command: ["--config", "config.yaml", "--interval", "300"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
