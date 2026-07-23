@@ -1,0 +1,33 @@
+# Small Account Policy
+# Applies when: equity < 50 USDT
+# Override config.default.yaml for micro-capital constraints
+
+policy_name: small_account
+applies_when:
+  equity_lt_usdt: 50
+
+sleeves:
+  reserve_pct: 0.30
+  spot_core_pct: 0.20
+  perp_sar_pct: 0.50              # up to 50% of risk budget
+  spot_margin_pct: 0.00           # ALWAYS off on small accounts
+  earn_flex_pct: 0.00             # optional dust only
+
+risk:
+  per_trade_pct: 0.01             # 1% risk per trade (larger % needed for min notional)
+  max_open_risk_pct: 0.03
+  daily_loss_halt_pct: 0.05
+  max_leverage_linear: 15
+  enable_spot_margin: false
+  enable_recovery: false
+
+fees:
+  min_edge_multiple_of_rt: 2.5    # never relax this even on small accounts
+  prefer_postonly: true
+
+notes: |
+  On dust equity the fee gate is MORE important, not less.
+  One bad trade = significant % loss.
+  Prefer 1 high-quality SAR setup over multiple scalps.
+  Min notional check is mandatory before every order.
+  If equity too small for min notional → RECOMMEND deposit, do not skip filters.

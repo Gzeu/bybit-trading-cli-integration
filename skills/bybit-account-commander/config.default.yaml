@@ -1,0 +1,68 @@
+# Bybit Account Commander - Default Configuration
+# Copy to config.yaml and adjust to your risk profile
+# Agent reads this at startup and NEVER silently exceeds limits
+
+env: mainnet                      # mainnet | testnet
+autonomous: false                 # true = auto-execute within caps
+auto_max_notional_usdt: 25       # max single auto-execute notional
+transfer_auto_cap_usdt: 20       # max auto FUND->UNIFIED transfer
+
+sleeves:
+  reserve_pct: 0.30              # 30% never touched
+  spot_core_pct: 0.30            # BTC/ETH spot holdings
+  perp_sar_pct: 0.25             # SAR perp sleeve
+  spot_margin_pct: 0.00          # OFF by default
+  earn_flex_pct: 0.15            # flexible earn only
+
+risk:
+  per_trade_pct: 0.0075          # 0.75% risk per perp trade
+  max_open_risk_pct: 0.025       # 2.5% max aggregate open risk
+  daily_loss_halt_pct: 0.03      # -3% equity daily halt
+  max_leverage_linear: 20        # hard cap linear leverage
+  enable_spot_margin: false      # spot margin kill-switch
+  enable_inverse: false          # inverse perps kill-switch
+  enable_options: false          # options trading kill-switch
+  enable_recovery: false         # SAR recovery hedge mode
+  recovery_max_extra_r: 0.5      # max +0.5R on recovery attempt
+  cooldown_bars_after_sl: 15     # bars cooldown per symbol after hard SL
+
+mmr_guard:
+  warn_pct: 60                   # warn + stop new risk
+  critical_pct: 80               # auto deleverage
+
+sar:
+  af_start: 0.02
+  af_step: 0.02
+  af_max: 0.20
+  tf_primary: "5"                # 5m primary timeframe
+  tf_filter: "60"                # 1h filter timeframe
+  flip_confirm_bars: 1
+  adx_min: 18
+  rr_min: 1.8
+  symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+
+fees:
+  min_edge_multiple_of_rt: 2.5   # edge must be >= 2.5x round-trip fee
+  prefer_postonly: true
+
+profit_routing:
+  skim_to_spot_pct: 0.40         # 40% of net perp profits → spot
+  spot_symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+
+earn:
+  only_flexible: true            # never fixed/structured without CONFIRM
+  min_idle_usdt_to_earn: 20      # minimum idle before parking in earn
+
+watchlist:
+  - "BTCUSDT"
+  - "ETHUSDT"
+
+confirm:
+  mainnet_writes: true           # require CONFIRM on all mainnet writes
+  mode_changes: true             # require CONFIRM on margin/leverage mode changes
+  earn_fixed: true               # require CONFIRM on fixed/structured earn
+  transfer_above_cap: true       # require CONFIRM on transfers above cap

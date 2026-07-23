@@ -1,0 +1,49 @@
+# Production Policy
+# Applies when: equity >= 200 USDT, autonomous mode enabled
+# Stricter gates for real capital deployment
+
+policy_name: production
+applies_when:
+  equity_gte_usdt: 200
+  autonomous: true
+
+sleeves:
+  reserve_pct: 0.25
+  spot_core_pct: 0.35
+  perp_sar_pct: 0.25
+  spot_margin_pct: 0.05           # small allocation if approved
+  earn_flex_pct: 0.10
+
+risk:
+  per_trade_pct: 0.0075
+  max_open_risk_pct: 0.02
+  daily_loss_halt_pct: 0.03
+  max_leverage_linear: 15
+  enable_spot_margin: false        # still needs explicit enable
+  enable_recovery: false
+  cooldown_bars_after_sl: 20
+
+auto_max_notional_usdt: 100
+transfer_auto_cap_usdt: 50
+
+mmr_guard:
+  warn_pct: 55
+  critical_pct: 75
+
+fees:
+  min_edge_multiple_of_rt: 3.0    # higher bar in production
+  prefer_postonly: true
+
+profit_routing:
+  skim_to_spot_pct: 0.40
+  trigger_min_net_usdt: 1.0       # only skim if net profit > 1 USDT
+
+confirm:
+  mainnet_writes: true
+  mode_changes: true
+
+notes: |
+  Production mode: autonomous execution allowed within caps.
+  All mode/margin/leverage changes still require CONFIRM.
+  Daily halt is hard — no override without manual reset.
+  Skim to spot only on confirmed net positive exits.
